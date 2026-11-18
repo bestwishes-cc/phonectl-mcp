@@ -90,8 +90,9 @@ Coordinates are iOS points, the same as the pixels of the returned screenshot.
 | --- | --- |
 | `screenshot` | Captures the screen |
 | `read_text` | Text on screen with positions, as JSON. Much cheaper than an image |
+| `tap_text`, `wait_text` | Tap text found on screen; wait until text appears or goes away |
 | `tap`, `long_press`, `swipe` | Touch. To scroll down, swipe upward |
-| `type_text` | Types into the focused field. Non-ASCII text goes through the clipboard |
+| `type_text` | Types into the focused field by pasting, so the phone's input method cannot change it; submit with `press_key('enter')`. `method="keys"` types key by key, for fields that refuse pasting |
 | `press_key` | A key or chord, such as `enter` or `cmd+a` |
 | `press_button` | `home`, `lock`, `volume-up`, `volume-down`, `mute`, `siri` |
 | `launch_app`, `list_apps` | Opens apps, finds bundle ids |
@@ -131,7 +132,7 @@ Run `phonectl doctor` first. It tells you which link is broken.
 | `PHONECTL_TOKEN_FILE` | `~/.config/phonectl/token` | Where the token is kept |
 | `PHONECTL_SCALE` | `3` | Pixels per point; 2 on iPhone SE, XR, 11. Only affects screenshot size |
 | `PHONECTL_OCR_LANGS` | `zh-Hans,en-US` | `read_text` languages, in priority order |
-| `PHONECTL_SETTLE` | `0.6` | Seconds to wait before the screenshot after an action |
+| `PHONECTL_SETTLE` | `0.6` | Seconds to wait before the screenshot after an action; `settle_ms` overrides it per call |
 | `PHONECTL_TOUCH_IDLE` | `30` | Idle seconds before the input stream closes (reopening takes ~0.6 s) |
 | `PHONECTL_KEY_IDLE` | `5` | Seconds without a key before the virtual keyboard detaches, so the on-screen keyboard comes back |
 | `PHONECTL_CALL_TIMEOUT` | `15` | Seconds to wait for the phone, on top of the gesture time |

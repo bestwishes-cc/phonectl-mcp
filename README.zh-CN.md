@@ -90,8 +90,9 @@ claude mcp add --scope user --transport http phone http://127.0.0.1:47321/mcp \
 | --- | --- |
 | `screenshot` | 截图 |
 | `read_text` | 以 JSON 返回屏幕文字和位置，比看图省得多 |
+| `tap_text`、`wait_text` | 按屏幕上的文字点按；等文字出现或消失 |
 | `tap`、`long_press`、`swipe` | 点按、长按、滑动。往下翻要向上滑 |
-| `type_text` | 往当前输入框打字，非 ASCII 文字经剪贴板粘贴 |
+| `type_text` | 往当前输入框打字，经剪贴板粘贴，不受手机输入法影响；提交要另按 `press_key('enter')`。`method="keys"` 逐键输入，用于禁止粘贴的输入框 |
 | `press_key` | 按键或组合键，如 `enter`、`cmd+a` |
 | `press_button` | `home`、`lock`、`volume-up`、`volume-down`、`mute`、`siri` |
 | `launch_app`、`list_apps` | 启动 App，查 bundle id |
@@ -131,7 +132,7 @@ claude mcp add --scope user --transport http phone http://127.0.0.1:47321/mcp \
 | `PHONECTL_TOKEN_FILE` | `~/.config/phonectl/token` | 令牌文件位置 |
 | `PHONECTL_SCALE` | `3` | 每 point 几个像素；iPhone SE、XR、11 填 2。只影响截图大小 |
 | `PHONECTL_OCR_LANGS` | `zh-Hans,en-US` | `read_text` 识别语言，按优先级 |
-| `PHONECTL_SETTLE` | `0.6` | 操作后等几秒再截图 |
+| `PHONECTL_SETTLE` | `0.6` | 操作后等几秒再截图；单次调用可用 `settle_ms` 覆盖 |
 | `PHONECTL_TOUCH_IDLE` | `30` | 空闲几秒后关闭输入通道（重开约 0.6 秒） |
 | `PHONECTL_KEY_IDLE` | `5` | 几秒没按键后断开虚拟键盘，屏幕键盘随之回来 |
 | `PHONECTL_CALL_TIMEOUT` | `15` | 等手机响应几秒算失败（不含手势耗时） |

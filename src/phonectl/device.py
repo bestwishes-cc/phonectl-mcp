@@ -68,6 +68,9 @@ BUTTONS: dict[str, tuple[int, int, float]] = {
     "siri": (0x0C, 0xCF, 1.0),
 }
 
+# Wait after releasing a button before returning; see press_button.
+BUTTON_AFTER_S = 0.4
+
 # Touch coordinates are 0..NORM_MAX across the screen on both axes, whatever its resolution.
 NORM_MAX = 65535
 # How long the input stream stays open without input. 45 s was verified to still deliver taps;
@@ -384,14 +387,17 @@ class Device:
             await hid.send_button(page, code, HID_BUTTON_STATE_DOWN)
             await asyncio.sleep(hold)
             await hid.send_button(page, code, HID_BUTTON_STATE_UP)
-            # dtuhidd handles messages asynchronously; closing at once can drop the UP.
-            await asyncio.sleep(0.1)
+            # dtuhidd handles messages asynchronously: closing at once can drop the UP, and iOS
+            # acts on the press only some time after it. Returning too soon let a launch_app
+            # right after 'home' open the app before the press arrived and sent it to the
+            # background: with 0.2 s here that happened 10 times in 10, with 0.4 s never in 6.
+            await asyncio.sleep(BUTTON_AFTER_S)
 
         async def op():
             async with IndigoHIDService(self._rsd) as hid:
                 await _run_counted(hid, press)
 
-        await self._retry(op, extra_s=hold, repeatable=False)
+        await self._retry(op, extra_s=hold + BUTTON_AFTER_S, repeatable=False)
 
     async def set_clipboard(self, text: str) -> None:
         async def op():
