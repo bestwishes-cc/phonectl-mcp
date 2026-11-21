@@ -19,6 +19,7 @@ waits while another client is using it and gives it up when done.
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import re
 import sys
@@ -64,8 +65,25 @@ def wait_any(phone: Phone, texts: tuple[str, ...], timeout_s: float) -> tuple[st
 
 
 def search_words(words: str) -> str:
-    """words without what breaks an X phrase search: emoji, colons and other symbols."""
+    """words without what breaks an X phrase search: emoji, colons and other symbols. In Chinese
+    text, spaces and Latin words between the characters also break it: keep the longest run of
+    Chinese characters then."""
+    han = max(re.findall(r"[\u4e00-\u9fff]+", words), key=len, default="")
+    if len(han) >= 4:
+        return han
     return " ".join(re.sub(r"[^\w\s'.,!?-]", " ", words).split())
+
+
+def shows(lines: list[dict], text: str, n: int = 16) -> bool:
+    """Whether the screen shows the first n letters and digits of text, allowing for OCR misreads
+    (按 read as 接): some stretch of the screen matches at least 80% of them."""
+    want = _norm(text)[:n]
+    screen = _norm("".join(line["t"] for line in lines))
+    if len(want) < 6 or want in screen:  # too short to allow a misread
+        return bool(want) and want in screen
+    m = len(want)
+    return any(difflib.SequenceMatcher(None, want, screen[i:i + m]).ratio() >= 0.8
+               for i in range(max(1, len(screen) - m + 1)))
 
 
 def find_post(lines: list[dict], words: str) -> dict | None:
@@ -96,6 +114,17 @@ def wait_post(phone: Phone, words: str, timeout_s: float) -> dict | None:
         time.sleep(0.2)
 
 
+def _settled(phone: Phone, words: str, hit: dict) -> dict | None:
+    """The post's line once it is at the same place in two reads in a row (or None if gone)."""
+    for _ in range(10):
+        time.sleep(0.3)
+        again = find_post(phone.read_text(), words)
+        if again is None or abs(again["y"] - hit["y"]) < 2:
+            return again
+        hit = again
+    return hit
+
+
 def run(phone: Phone, url: str, words: str, reply: str, dry_run: bool) -> str:
     progress = {"step": "start"}
     try:
@@ -118,7 +147,11 @@ def _steps(phone: Phone, url: str, words: str, reply: str, dry_run: bool, progre
 
     progress["step"] = step = "open the post"
     found = None
-    for _ in range(2):  # the first tap after the results appear is at times not taken
+    for _ in range(3):  # a tap while the results still move is at times not taken
+        hit = _settled(phone, words, hit)
+        if hit is None:  # the results are gone: the post is opening
+            found = wait_any(phone, REPLY_FIELD + RESTRICTED, 7)
+            break
         phone.tap(hit["x"], hit["y"])
         found = wait_any(phone, REPLY_FIELD + RESTRICTED, 3)
         if found is not None:
@@ -129,6 +162,9 @@ def _steps(phone: Phone, url: str, words: str, reply: str, dry_run: bool, progre
             break
     if found is None:
         raise Stop("failed", step, "the post did not open (no reply field)")
+    lines = found[1]
+    if not (shows(lines, words) and _norm(path[0]) in _norm("".join(line["t"] for line in lines))):
+        raise Stop("failed", step, f"the page that opened is not @{path[0]}'s post with these words")
     if found[0] in RESTRICTED:
         raise Stop("restricted", step, "the author limits who can reply")
 
@@ -144,16 +180,14 @@ def _steps(phone: Phone, url: str, words: str, reply: str, dry_run: bool, progre
         phone.tap_text(popup[0], settle_ms=300)
 
     progress["step"] = step = "check the text"
-    want = _norm(reply)[:12]
-    screen = _norm("".join(line["t"] for line in phone.read_text()))
-    if want not in screen:
-        raise Stop("failed", step, f"the pasted text is not on the screen (looked for {want!r})")
+    if not shows(phone.read_text(), reply):
+        raise Stop("failed", step, f"the pasted text is not on the screen (looked for {_norm(reply)[:16]!r})")
 
     if dry_run:
         progress["step"] = step = "leave without sending"
         phone.press_key("cmd+a")
         phone.press_key("backspace", settle_ms=300)
-        if want in _norm("".join(line["t"] for line in phone.read_text())):
+        if shows(phone.read_text(), reply):
             raise Stop("failed", step, "the text is still in the reply box")
         return "dry_run"  # the reply box stays open and empty, so X keeps no draft
 

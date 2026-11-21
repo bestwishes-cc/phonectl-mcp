@@ -39,3 +39,15 @@ def test_no_results_is_not_a_post():
 
 def test_search_words_leave_out_emoji_and_colons():
     assert x_reply.search_words("GOOGLE 🔥: Usage limits") == "GOOGLE Usage limits"
+
+
+def test_chinese_search_words_keep_the_longest_run_of_characters():
+    assert x_reply.search_words("关于 AI 视频创作生成") == "视频创作生成"
+
+
+def test_the_pasted_text_is_found_despite_a_misread_character():
+    reply = "先按需求拆分镜头，再统一风格"
+    lines = _lines(("先接需求拆分镜头，再统一风格", 300))
+    assert x_reply.shows(lines, reply)
+    assert not x_reply.shows(_lines(("完全不同的一段文字内容在这里", 300)), reply)
+    assert not x_reply.shows(_lines(("ab", 300)), "abc")
