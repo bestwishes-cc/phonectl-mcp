@@ -354,8 +354,9 @@ async def press_button(name: str, screenshot: bool = True, settle_ms: Optional[i
 async def launch_app(bundle_id: str, restart: bool = False, url: Optional[str] = None,
                      screenshot: bool = True, settle_ms: Optional[int] = None) -> list[str | Image]:
     """Open an app by bundle id (see list_apps). An app already running is brought to the
-    front as it was; restart=True kills it first. url: a link for the app to open, as if
-    tapped (e.g. a post's https://x.com/... link in X), which skips navigating to it."""
+    front as it was; restart=True kills it first. url: a link for the app to open, which can
+    skip navigating there (e.g. https://... in Safari, twitter://search?query=... in X). The app
+    decides what a link does: X ignores links to posts and stays where it was, so check."""
     await device.launch_app(bundle_id, restart=restart, url=url)
     return await _after(f"launched {bundle_id}" + (f" with {url}" if url else ""), screenshot, settle_ms)
 

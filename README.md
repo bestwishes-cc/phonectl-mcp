@@ -95,7 +95,7 @@ Coordinates are iOS points, the same as the pixels of the returned screenshot.
 | `type_text` | Types into the focused field by pasting, so the phone's input method cannot change it; submit with `press_key('enter')`. `method="keys"` types key by key, for fields that refuse pasting |
 | `press_key` | A key or chord, such as `enter` or `cmd+a` |
 | `press_button` | `home`, `lock`, `volume-up`, `volume-down`, `mute`, `siri` |
-| `launch_app`, `list_apps` | Opens apps (with `url`, straight to a link inside the app), finds bundle ids |
+| `launch_app`, `list_apps` | Opens apps (with `url`, hands the app a link to open), finds bundle ids |
 | `get_clipboard`, `set_clipboard` | The phone's clipboard |
 | `status` | The server, the phone link, and who is using the phone |
 
@@ -111,15 +111,15 @@ All clients of the server share the phone, and they take turns: a client that st
 
 ## Scripts
 
-A fixed sequence (open a post, tap the reply field, paste, send) does not need a model to think between the steps. As a script, it is one command for the agent instead of one model round trip per step:
+A fixed sequence (find a post, tap the reply field, paste, send) does not need a model to think between the steps. As a script, it is one command for the agent instead of one model round trip per step:
 
 ```python
 from phonectl.client import Phone
 
 with Phone() as phone:  # run from a terminal, it gives the phone up at the end
-    phone.launch_app("com.atebits.Tweetie2", url="https://x.com/user/status/123")
-    phone.tap_text("Post your reply", timeout_s=10)
-    phone.type_text("Nice.")
+    phone.launch_app("com.atebits.Tweetie2", url="twitter://search?query=from%3Asomeone")
+    phone.tap_text("Latest", timeout_s=10)
+    print([line["t"] for line in phone.read_text()])
 ```
 
 `phonectl.client` uses only the standard library and the same token. Its calls share the phone like an agent's: they wait while another client has it, and `ScreenChanged` is raised where an agent would get `NOT DONE`. [`examples/x_reply.py`](examples/x_reply.py) is a whole flow that reports, when it stops, at which step and what was on the screen, so the agent that ran it can take over.

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Reply to a post in the X app on the phone, as one command: an example of a flow script.
 
-    python examples/x_reply.py https://x.com/someone/status/123 "the reply" [--dry-run]
+    python examples/x_reply.py https://x.com/someone/status/123 "words from the post" "the reply" [--dry-run]
 
-It opens the post by its link, taps the reply field, pastes the text, checks it and sends it;
---dry-run clears the text and leaves instead of sending. An agent that would otherwise take
+It finds the post with X search (from:someone "words from the post"), opens it, taps the reply
+field, pastes the text, checks it and sends it; --dry-run clears the text instead of
+sending it. (X ignores post links handed to it at launch: twitter://status and https links both
+leave it on the home timeline, while twitter://search works.) An agent that would otherwise take
 twenty-odd model round trips for this runs one command and reads one line.
 
 It prints one JSON line and exits 0 when the reply went out (or the dry run reached the send
@@ -20,14 +22,16 @@ import json
 import re
 import sys
 import time
+from urllib.parse import quote, urlparse
 
 from phonectl.client import Phone, PhoneError
 
 X = "com.atebits.Tweetie2"
 # The app shows Chinese or English depending on the phone's language.
-REPLY_FIELD = ("发布你的回复", "Post your reply")
+REPLY_FIELD = ("发布你", "Post your reply")  # OCR at times drops the 的 of 发布你的回复
+LATEST = ("最新", "Latest")  # a tab of the search results, above the posts
 RESTRICTED = ("可以回复", "can reply")  # "只有部分账号可以回复", "Only some accounts can reply"
-CANCEL = ("取消", "Cancel")
+REPLY_BOX = ("回复 @", "Replying to")  # over the text field once the reply box is open
 SEND = ("回复", "Reply")
 ALLOW_PASTE = ("允许粘贴", "Allow Paste")
 SENT = ("已发送", "was sent")
@@ -57,18 +61,53 @@ def wait_any(phone: Phone, texts: tuple[str, ...], timeout_s: float) -> tuple[st
         time.sleep(0.2)
 
 
-def run(phone: Phone, url: str, reply: str, dry_run: bool) -> str:
+def find_post(lines: list[dict], words: str) -> dict | None:
+    """The line of a search result (below the result tabs) that begins the post's text."""
+    tabs = [line["y"] for line in lines if line["t"].strip() in LATEST]
+    want = _norm(words)[:16]
+    return next((line for line in lines if tabs and line["y"] > tabs[0] and want and
+                 (want in _norm(line["t"]) or _norm(line["t"]) in want and len(_norm(line["t"])) >= 6)), None)
+
+
+def wait_post(phone: Phone, words: str, timeout_s: float) -> dict | None:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        hit = find_post(phone.read_text(), words)
+        if hit or time.monotonic() >= deadline:
+            return hit
+        time.sleep(0.2)
+
+
+def run(phone: Phone, url: str, words: str, reply: str, dry_run: bool) -> str:
     progress = {"step": "start"}
     try:
-        return _steps(phone, url, reply, dry_run, progress)
+        return _steps(phone, url, words, reply, dry_run, progress)
     except PhoneError as e:  # a tool call failed: say during which step
         raise Stop("failed", progress["step"], str(e)) from e
 
 
-def _steps(phone: Phone, url: str, reply: str, dry_run: bool, progress: dict) -> str:
+def _steps(phone: Phone, url: str, words: str, reply: str, dry_run: bool, progress: dict) -> str:
+    progress["step"] = step = "search for the post"
+    path = urlparse(url).path.strip("/").split("/")
+    if len(path) < 3 or path[1] != "status":
+        raise Stop("failed", step, f"not a post link: {url}")
+    query = f'from:{path[0]} "{words}"'
+    phone.launch_app(X, url="twitter://search?query=" + quote(query))
+    hit = wait_post(phone, words, 10)
+    if hit is None:
+        raise Stop("failed", step, f"no search result with the post's words for {query}")
+
     progress["step"] = step = "open the post"
-    phone.launch_app(X, url=url)
-    found = wait_any(phone, REPLY_FIELD + RESTRICTED, 15)
+    found = None
+    for _ in range(2):  # the first tap after the results appear is at times not taken
+        phone.tap(hit["x"], hit["y"])
+        found = wait_any(phone, REPLY_FIELD + RESTRICTED, 3)
+        if found is not None:
+            break
+        hit = find_post(phone.read_text(), words)
+        if hit is None:
+            found = wait_any(phone, REPLY_FIELD + RESTRICTED, 7)
+            break
     if found is None:
         raise Stop("failed", step, "the post did not open (no reply field)")
     if found[0] in RESTRICTED:
@@ -76,7 +115,7 @@ def _steps(phone: Phone, url: str, reply: str, dry_run: bool, progress: dict) ->
 
     progress["step"] = step = "open the reply box"
     phone.tap_text(found[0])
-    if wait_any(phone, CANCEL, 5) is None:
+    if wait_any(phone, REPLY_BOX, 5) is None:
         raise Stop("failed", step, "no reply box after tapping the reply field")
 
     progress["step"] = step = "paste the reply"
@@ -94,12 +133,10 @@ def _steps(phone: Phone, url: str, reply: str, dry_run: bool, progress: dict) ->
     if dry_run:
         progress["step"] = step = "leave without sending"
         phone.press_key("cmd+a")
-        phone.press_key("backspace", settle_ms=200)
-        cancel = wait_any(phone, CANCEL, 2)
-        if cancel is None:
-            raise Stop("failed", step, "no Cancel button to leave the reply box")
-        phone.tap_text(cancel[0], settle_ms=500)
-        return "dry_run"
+        phone.press_key("backspace", settle_ms=300)
+        if want in _norm("".join(line["t"] for line in phone.read_text())):
+            raise Stop("failed", step, "the text is still in the reply box")
+        return "dry_run"  # the reply box stays open and empty, so X keeps no draft
 
     progress["step"] = step = "send"
     lines = phone.read_text()
@@ -115,6 +152,7 @@ def _steps(phone: Phone, url: str, reply: str, dry_run: bool, progress: dict) ->
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("url", help="the post's link, https://x.com/<user>/status/<id>")
+    ap.add_argument("words", help="a few words from the start of the post, to find it with")
     ap.add_argument("reply", help="the reply text, pasted as it is")
     ap.add_argument("--dry-run", action="store_true", help="do everything but send")
     args = ap.parse_args()
@@ -122,7 +160,7 @@ def main() -> int:
     out: dict = {}
     with Phone() as phone:
         try:
-            out = {"status": run(phone, args.url, args.reply, args.dry_run)}
+            out = {"status": run(phone, args.url, args.words, args.reply, args.dry_run)}
         except Stop as e:
             out = {"status": e.status, "step": e.step, "detail": e.detail}
         if out["status"] not in ("sent", "dry_run"):

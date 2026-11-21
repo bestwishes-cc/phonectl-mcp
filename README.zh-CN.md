@@ -95,7 +95,7 @@ claude mcp add --scope user --transport http phone http://127.0.0.1:47321/mcp \
 | `type_text` | 往当前输入框打字，经剪贴板粘贴，不受手机输入法影响；提交要另按 `press_key('enter')`。`method="keys"` 逐键输入，用于禁止粘贴的输入框 |
 | `press_key` | 按键或组合键，如 `enter`、`cmd+a` |
 | `press_button` | `home`、`lock`、`volume-up`、`volume-down`、`mute`、`siri` |
-| `launch_app`、`list_apps` | 启动 App（带 `url` 时直接打开 App 里的某个链接），查 bundle id |
+| `launch_app`、`list_apps` | 启动 App（带 `url` 时把一个链接交给 App 打开），查 bundle id |
 | `get_clipboard`、`set_clipboard` | 读写手机剪贴板 |
 | `status` | 服务、手机连接状态，以及谁在用手机 |
 
@@ -111,15 +111,15 @@ claude mcp add --scope user --transport http phone http://127.0.0.1:47321/mcp \
 
 ## 脚本
 
-步骤固定的流程（打开帖子、点回复框、粘贴、发送）不需要模型在每一步之间思考。写成脚本后，Agent 只需要运行一条命令，不再每一步都和模型往返一次：
+步骤固定的流程（找到帖子、点回复框、粘贴、发送）不需要模型在每一步之间思考。写成脚本后，Agent 只需要运行一条命令，不再每一步都和模型往返一次：
 
 ```python
 from phonectl.client import Phone
 
 with Phone() as phone:  # 从终端运行时，结束后把手机让出来
-    phone.launch_app("com.atebits.Tweetie2", url="https://x.com/user/status/123")
-    phone.tap_text("发布你的回复", timeout_s=10)
-    phone.type_text("不错。")
+    phone.launch_app("com.atebits.Tweetie2", url="twitter://search?query=from%3Asomeone")
+    phone.tap_text("最新", timeout_s=10)
+    print([line["t"] for line in phone.read_text()])
 ```
 
 `phonectl.client` 只用标准库，令牌和服务相同。它的调用和 Agent 一样共用手机：别人在用时排队等待；Agent 收到 `NOT DONE` 的情况，脚本里会抛出 `ScreenChanged`。[`examples/x_reply.py`](examples/x_reply.py) 是一个完整的流程，中途停下时会报告停在哪一步、屏幕上有什么，运行它的 Agent 可以接着处理。
