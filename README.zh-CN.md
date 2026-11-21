@@ -162,7 +162,7 @@ with Phone() as phone:  # 从终端运行时，结束后把手机让出来
 | `PHONECTL_IDLE` | `90` | 一个客户端连续几秒没有调用，就算用完了手机 |
 | `PHONECTL_WAIT` | `180` | 调用最多等几秒手机，超时报 `Busy`；要短于客户端自己的工具超时 |
 | `PHONECTL_MAX_HOLD` | `600` | 一个客户端连续占用这么久以后，让排队的客户端先用 |
-| `PHONECTL_LOG` | `WARNING` | 日志级别（服务为 `INFO`，会记下每次调用来自哪个客户端），日志在 `~/Library/Logs/phonectl*.log` |
+| `PHONECTL_LOG` | `WARNING` | 日志级别（服务为 `INFO`，会记下每次调用来自哪个客户端），日志在 `~/Library/Logs/phonectl*.log`；一个日志超过 10 MB 时，旧内容移到 `<文件名>.1`，替换更早的那份 |
 
 </details>
 

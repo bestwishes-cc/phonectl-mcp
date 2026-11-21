@@ -162,7 +162,7 @@ Run `phonectl doctor` first. It tells you which link is broken.
 | `PHONECTL_IDLE` | `90` | Seconds without a call after which a client has finished with the phone |
 | `PHONECTL_WAIT` | `180` | Seconds a call waits for the phone before failing with `Busy`; keep it below the client's own tool timeout |
 | `PHONECTL_MAX_HOLD` | `600` | After holding the phone this long, a client lets a waiting one go first |
-| `PHONECTL_LOG` | `WARNING` | Log level (`INFO` for the service, which logs each call with its client); logs in `~/Library/Logs/phonectl*.log` |
+| `PHONECTL_LOG` | `WARNING` | Log level (`INFO` for the service, which logs each call with its client); logs in `~/Library/Logs/phonectl*.log`; a log over 10 MB moves to `<file>.1`, replacing the older one |
 
 </details>
 

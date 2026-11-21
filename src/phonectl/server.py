@@ -35,7 +35,7 @@ from PIL import Image as PILImage
 
 from pymobiledevice3.exceptions import CoreDeviceError
 
-from . import __version__
+from . import __version__, logtrim
 from .arbiter import Arbiter, Busy, Client, Lease, identify
 from .device import NORM_MAX, Device, InputUncertain
 from .keys import parse_key
@@ -503,6 +503,7 @@ def _serve_http() -> None:
     import uvicorn
 
     arbiter.assume_used_before()  # clients may have used the phone through a server before this one
+    logtrim.keep_trimmed()  # the service logs every call; launchd's log files would only grow
 
     hosts = [f"{HTTP_HOST}:{HTTP_PORT}", f"localhost:{HTTP_PORT}"]
     app = mcp.streamable_http_app(
