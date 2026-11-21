@@ -74,16 +74,19 @@ def search_words(words: str) -> str:
     return " ".join(re.sub(r"[^\w\s'.,!?-]", " ", words).split())
 
 
-def shows(lines: list[dict], text: str, n: int = 16) -> bool:
-    """Whether the screen shows the first n letters and digits of text, allowing for OCR misreads
-    (按 read as 接): some stretch of the screen matches at least 80% of them."""
-    want = _norm(text)[:n]
-    screen = _norm("".join(line["t"] for line in lines))
-    if len(want) < 6 or want in screen:  # too short to allow a misread
-        return bool(want) and want in screen
+def _holds(seen: str, want: str) -> bool:
+    """Whether seen (normalized) holds want, allowing for OCR misreads (按 read as 接, 士 as 土):
+    some stretch of seen matches at least 80% of want. A want under 6 characters must match."""
+    if len(want) < 6 or want in seen:  # too short to allow a misread
+        return bool(want) and want in seen
     m = len(want)
-    return any(difflib.SequenceMatcher(None, want, screen[i:i + m]).ratio() >= 0.8
-               for i in range(max(1, len(screen) - m + 1)))
+    return any(difflib.SequenceMatcher(None, want, seen[i:i + m]).ratio() >= 0.8
+               for i in range(max(1, len(seen) - m + 1)))
+
+
+def shows(lines: list[dict], text: str, n: int = 16) -> bool:
+    """Whether the screen shows the first n letters and digits of text, misreads allowed."""
+    return _holds(_norm("".join(line["t"] for line in lines)), _norm(text)[:n])
 
 
 def find_post(lines: list[dict], words: str) -> dict | None:
@@ -94,11 +97,11 @@ def find_post(lines: list[dict], words: str) -> dict | None:
     if not want:
         return None
     tabs = [line["y"] for line in lines
-            if any(t in line["t"] for t in LATEST) and want not in _norm(line["t"])]
+            if any(t in line["t"] for t in LATEST) and not _holds(_norm(line["t"]), want)]
     if not tabs:
         return None
     return next((line for line in lines if line["y"] > min(tabs) and
-                 (want in _norm(line["t"]) or _norm(line["t"]) in want and len(_norm(line["t"])) >= 6)), None)
+                 (_holds(_norm(line["t"]), want) or _norm(line["t"]) in want and len(_norm(line["t"])) >= 6)), None)
 
 
 def wait_post(phone: Phone, words: str, timeout_s: float) -> dict | None:
@@ -125,6 +128,22 @@ def _settled(phone: Phone, words: str, hit: dict) -> dict | None:
     return hit
 
 
+def _open(phone: Phone, words: str, hit: dict) -> tuple[str, list[dict]] | None:
+    """Tap the post in the results until its page shows; what wait_any returns for it, or None."""
+    for _ in range(3):  # a tap while the results still move or reload is at times not taken
+        hit = _settled(phone, words, hit)
+        if hit is None:  # the results are gone: the post is opening
+            return wait_any(phone, REPLY_FIELD + RESTRICTED, 7)
+        phone.tap(hit["x"], hit["y"])
+        found = wait_any(phone, REPLY_FIELD + RESTRICTED, 3)
+        if found is not None:
+            return found
+        hit = find_post(phone.read_text(), words)
+        if hit is None:
+            return wait_any(phone, REPLY_FIELD + RESTRICTED, 7)
+    return None
+
+
 def run(phone: Phone, url: str, words: str, reply: str, dry_run: bool) -> str:
     progress = {"step": "start"}
     try:
@@ -140,25 +159,16 @@ def _steps(phone: Phone, url: str, words: str, reply: str, dry_run: bool, progre
         raise Stop("failed", step, f"not a post link: {url}")
     words = search_words(words)
     query = f'from:{path[0]} "{words}"'
-    phone.launch_app(X, url="twitter://search?query=" + quote(query))
-    hit = wait_post(phone, words, 10)
-    if hit is None:
-        raise Stop("not_found", step, f"no post found with {query}")
-
-    progress["step"] = step = "open the post"
     found = None
-    for _ in range(3):  # a tap while the results still move is at times not taken
-        hit = _settled(phone, words, hit)
-        if hit is None:  # the results are gone: the post is opening
-            found = wait_any(phone, REPLY_FIELD + RESTRICTED, 7)
-            break
-        phone.tap(hit["x"], hit["y"])
-        found = wait_any(phone, REPLY_FIELD + RESTRICTED, 3)
-        if found is not None:
-            break
-        hit = find_post(phone.read_text(), words)
+    for _ in range(2):  # X at times takes no tap on the results; searching again has helped
+        progress["step"] = step = "search for the post"
+        phone.launch_app(X, url="twitter://search?query=" + quote(query))
+        hit = wait_post(phone, words, 10)
         if hit is None:
-            found = wait_any(phone, REPLY_FIELD + RESTRICTED, 7)
+            raise Stop("not_found", step, f"no post found with {query}")
+        progress["step"] = step = "open the post"
+        found = _open(phone, words, hit)
+        if found is not None:
             break
     if found is None:
         raise Stop("failed", step, "the post did not open (no reply field)")

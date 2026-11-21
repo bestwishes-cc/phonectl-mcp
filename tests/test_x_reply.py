@@ -51,3 +51,9 @@ def test_the_pasted_text_is_found_despite_a_misread_character():
     assert x_reply.shows(lines, reply)
     assert not x_reply.shows(_lines(("完全不同的一段文字内容在这里", 300)), reply)
     assert not x_reply.shows(_lines(("ab", 300)), "abc")
+
+
+def test_finds_the_post_despite_a_misread_character():
+    lines = _lines(('"据知情人士透露"', 86), ("热门", 139), ("最新", 139), ("CuiMao", 180),
+                   ("突发：据知情人土透露，黄仁勋夫妻之间有严", 204))
+    assert x_reply.find_post(lines, "据知情人士透露")["y"] == 204
