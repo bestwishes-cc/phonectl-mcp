@@ -122,7 +122,7 @@ with Phone() as phone:  # run from a terminal, it gives the phone up at the end
     print([line["t"] for line in phone.read_text()])
 ```
 
-`phonectl.client` uses only the standard library and the same token. Its calls share the phone like an agent's: they wait while another client has it, and `ScreenChanged` is raised where an agent would get `NOT DONE`. [`examples/x_reply.py`](examples/x_reply.py) is a whole flow that reports, when it stops, at which step and what was on the screen, so the agent that ran it can take over.
+`phonectl.client` uses only the standard library and the same token. Its calls share the phone like an agent's: they wait while another client has it, and `ScreenChanged` is raised where an agent would get `NOT DONE`.
 
 ## Troubleshooting
 

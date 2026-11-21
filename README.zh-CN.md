@@ -122,7 +122,7 @@ with Phone() as phone:  # 从终端运行时，结束后把手机让出来
     print([line["t"] for line in phone.read_text()])
 ```
 
-`phonectl.client` 只用标准库，令牌和服务相同。它的调用和 Agent 一样共用手机：别人在用时排队等待；Agent 收到 `NOT DONE` 的情况，脚本里会抛出 `ScreenChanged`。[`examples/x_reply.py`](examples/x_reply.py) 是一个完整的流程，中途停下时会报告停在哪一步、屏幕上有什么，运行它的 Agent 可以接着处理。
+`phonectl.client` 只用标准库，令牌和服务相同。它的调用和 Agent 一样共用手机：别人在用时排队等待；Agent 收到 `NOT DONE` 的情况，脚本里会抛出 `ScreenChanged`。
 
 ## 排查问题
 
