@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import plistlib
 import time
 from contextlib import AsyncExitStack
 from typing import Any, Awaitable, Callable, Optional
@@ -228,6 +229,29 @@ def modifier_usages(mod_bits: int) -> tuple[int, ...]:
 InputOp = Callable[[UniversalHIDServiceService], Awaitable[None]]
 
 
+async def _launch_with_url(apps: AppServiceService, bundle_id: str, url: str, restart: bool) -> Any:
+    """Launch an app with a URL for it to open, as `devicectl device process launch
+    --payload-url` does. pymobiledevice3's launch_application has no field for it: CoreDevice
+    takes it as options.payloadURL (platformSpecificOptions.__PayloadURL is ignored)."""
+    return await apps.invoke(
+        "com.apple.coredevice.feature.launchapplication",
+        {
+            "applicationSpecifier": {"bundleIdentifier": {"_0": bundle_id}},
+            "options": {
+                "arguments": [],
+                "environmentVariables": {},
+                "standardIOUsesPseudoterminals": True,
+                "startStopped": False,
+                "terminateExisting": restart,
+                "user": {"shortName": "mobile"},
+                "platformSpecificOptions": plistlib.dumps({}),
+                "payloadURL": {"relative": url},
+            },
+            "standardIOIdentifiers": {},
+        },
+    )
+
+
 class Device:
     """Holds the tunnel and DVT session; reconnects once if a call fails on a dead link."""
 
@@ -356,12 +380,14 @@ class Device:
     async def screenshot_png(self) -> bytes:
         return await self._retry(lambda: self._shot.get_screenshot())
 
-    async def launch_app(self, bundle_id: str, restart: bool = False) -> list[dict[str, Any]]:
+    async def launch_app(self, bundle_id: str, restart: bool = False, url: Optional[str] = None) -> list[dict[str, Any]]:
         # pymobiledevice3 kills a running instance by default; an agent almost never wants
         # that, since it throws away whatever screen the app was on.
         async def op():
             async with AppServiceService(self._rsd) as apps:
                 try:
+                    if url is not None:
+                        return await _launch_with_url(apps, bundle_id, url, restart)
                     return await apps.launch_application(bundle_id, kill_existing=restart)
                 except CoreDeviceError as e:
                     if e.code != LAUNCHED_PID_UNKNOWN:

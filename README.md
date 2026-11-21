@@ -13,7 +13,7 @@
   <a href="https://github.com/jiefeng-ai/phonectl-mcp/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
 </p>
 
-<p align="center"><a href="#install">Install</a> · <a href="#tools">Tools</a> · <a href="#troubleshooting">Troubleshooting</a> · <a href="#security">Security</a></p>
+<p align="center"><a href="#install">Install</a> · <a href="#tools">Tools</a> · <a href="#several-agents-one-phone">Sharing</a> · <a href="#scripts">Scripts</a> · <a href="#troubleshooting">Troubleshooting</a> · <a href="#security">Security</a></p>
 
 An MCP server for screenshots, on-screen text, taps, swipes, typing, buttons, apps and the clipboard on an iPhone connected to your Mac. Nothing to install on the phone.
 
@@ -95,11 +95,34 @@ Coordinates are iOS points, the same as the pixels of the returned screenshot.
 | `type_text` | Types into the focused field by pasting, so the phone's input method cannot change it; submit with `press_key('enter')`. `method="keys"` types key by key, for fields that refuse pasting |
 | `press_key` | A key or chord, such as `enter` or `cmd+a` |
 | `press_button` | `home`, `lock`, `volume-up`, `volume-down`, `mute`, `siri` |
-| `launch_app`, `list_apps` | Opens apps, finds bundle ids |
+| `launch_app`, `list_apps` | Opens apps (with `url`, straight to a link inside the app), finds bundle ids |
 | `get_clipboard`, `set_clipboard` | The phone's clipboard |
-| `status` | The server and the phone link |
+| `status` | The server, the phone link, and who is using the phone |
 
 Tools that act on the phone return a screenshot taken afterwards (`screenshot=False` skips it). Taps are not confirmed, so check that screenshot.
+
+## Several agents, one phone
+
+All clients of the server share the phone, and they take turns: a client that starts using it keeps it until it has made no call for 90 s. A call from another client meanwhile waits (up to 180 s, then it fails with `Busy`) instead of landing on the other agent's screen. The waiting agent then carries on by itself, and waiting costs it no tokens. `status` says who has the phone.
+
+- Clients are told apart by their process: a Claude Code session and its subagents are one client. A script that an agent runs counts as that agent, so it neither waits for the agent nor takes the phone from it; a script started from a terminal is a client of its own. A process that runs several independent tasks sends a header `X-Phonectl-Client: <name>` per task. When a client's process exits, the phone is free at once.
+- A tap, swipe, typing or key press is sent only if the client has looked at the screen since anyone else used the phone. Otherwise the result says `NOT DONE` (with a fresh screenshot unless `screenshot=False`) and nothing is sent. This also holds for a client's first such input after the server starts, since the server cannot know who used the phone before. `tap_text`, `launch_app` and `press_button` need no old coordinates and are always sent.
+- The server cannot see you using the phone by hand: `phonectl hold 30m` keeps agents off it, `phonectl hold off` ends that.
+
+## Scripts
+
+A fixed sequence (open a post, tap the reply field, paste, send) does not need a model to think between the steps. As a script, it is one command for the agent instead of one model round trip per step:
+
+```python
+from phonectl.client import Phone
+
+with Phone() as phone:  # run from a terminal, it gives the phone up at the end
+    phone.launch_app("com.atebits.Tweetie2", url="https://x.com/user/status/123")
+    phone.tap_text("Post your reply", timeout_s=10)
+    phone.type_text("Nice.")
+```
+
+`phonectl.client` uses only the standard library and the same token. Its calls share the phone like an agent's: they wait while another client has it, and `ScreenChanged` is raised where an agent would get `NOT DONE`. [`examples/x_reply.py`](examples/x_reply.py) is a whole flow that reports, when it stops, at which step and what was on the screen, so the agent that ran it can take over.
 
 ## Troubleshooting
 
@@ -136,7 +159,10 @@ Run `phonectl doctor` first. It tells you which link is broken.
 | `PHONECTL_TOUCH_IDLE` | `30` | Idle seconds before the input stream closes (reopening takes ~0.6 s) |
 | `PHONECTL_KEY_IDLE` | `5` | Seconds without a key before the virtual keyboard detaches, so the on-screen keyboard comes back |
 | `PHONECTL_CALL_TIMEOUT` | `15` | Seconds to wait for the phone, on top of the gesture time |
-| `PHONECTL_LOG` | `WARNING` | Log level (`INFO` for the service); logs in `~/Library/Logs/phonectl*.log` |
+| `PHONECTL_IDLE` | `90` | Seconds without a call after which a client has finished with the phone |
+| `PHONECTL_WAIT` | `180` | Seconds a call waits for the phone before failing with `Busy`; keep it below the client's own tool timeout |
+| `PHONECTL_MAX_HOLD` | `600` | After holding the phone this long, a client lets a waiting one go first |
+| `PHONECTL_LOG` | `WARNING` | Log level (`INFO` for the service, which logs each call with its client); logs in `~/Library/Logs/phonectl*.log` |
 
 </details>
 

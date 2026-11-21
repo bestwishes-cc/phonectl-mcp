@@ -13,7 +13,7 @@
   <a href="https://github.com/jiefeng-ai/phonectl-mcp/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
 </p>
 
-<p align="center"><a href="#安装">安装</a> · <a href="#工具">工具</a> · <a href="#排查问题">排查问题</a> · <a href="#安全">安全</a></p>
+<p align="center"><a href="#安装">安装</a> · <a href="#工具">工具</a> · <a href="#多个-agent-共用一台手机">共用</a> · <a href="#脚本">脚本</a> · <a href="#排查问题">排查问题</a> · <a href="#安全">安全</a></p>
 
 一个 MCP 服务，对连着 Mac 的 iPhone 截图、读屏幕文字、点按、滑动、打字、按按钮、启动 App、读写剪贴板。手机上不用装东西。
 
@@ -95,11 +95,34 @@ claude mcp add --scope user --transport http phone http://127.0.0.1:47321/mcp \
 | `type_text` | 往当前输入框打字，经剪贴板粘贴，不受手机输入法影响；提交要另按 `press_key('enter')`。`method="keys"` 逐键输入，用于禁止粘贴的输入框 |
 | `press_key` | 按键或组合键，如 `enter`、`cmd+a` |
 | `press_button` | `home`、`lock`、`volume-up`、`volume-down`、`mute`、`siri` |
-| `launch_app`、`list_apps` | 启动 App，查 bundle id |
+| `launch_app`、`list_apps` | 启动 App（带 `url` 时直接打开 App 里的某个链接），查 bundle id |
 | `get_clipboard`、`set_clipboard` | 读写手机剪贴板 |
-| `status` | 服务和手机连接状态 |
+| `status` | 服务、手机连接状态，以及谁在用手机 |
 
 操作手机的工具会在操作后返回一张截图（传 `screenshot=False` 则不返回）。手机不确认点按是否生效，请看这张截图判断。
+
+## 多个 Agent 共用一台手机
+
+连到服务的客户端共用这台手机，轮流使用：一个客户端开始用手机后，就一直占着，直到它连续 90 秒没有调用。这期间别的客户端的调用会排队等待（最多 180 秒，超时报 `Busy`），不会落到对方的屏幕上。等到手机空出来，等待的 Agent 会自己接着做，等待期间不消耗 token。`status` 会显示谁在用手机。
+
+- 服务按进程区分客户端：一个 Claude Code 会话和它的子 Agent 算一个客户端。Agent 运行的脚本算作这个 Agent 本人，不用等它，也不会把手机从它手里拿走；从终端直接运行的脚本是一个单独的客户端。一个进程里跑几个互不相干的任务时，每个任务发送请求头 `X-Phonectl-Client: <名字>`。客户端的进程一退出，手机马上空出来。
+- 只有在别人用过手机之后、这个客户端又看过屏幕，它的点按、滑动、打字、按键才会发出。否则结果里写着 `NOT DONE`（除非传了 `screenshot=False`，否则附一张当前截图），什么都不发。服务启动后每个客户端的第一次这类操作也是如此，因为服务不知道之前谁用过手机。`tap_text`、`launch_app`、`press_button` 不依赖旧坐标，总是照常执行。
+- 服务看不到你本人在用手机：`phonectl hold 30m` 让各个 Agent 让开，`phonectl hold off` 结束。
+
+## 脚本
+
+步骤固定的流程（打开帖子、点回复框、粘贴、发送）不需要模型在每一步之间思考。写成脚本后，Agent 只需要运行一条命令，不再每一步都和模型往返一次：
+
+```python
+from phonectl.client import Phone
+
+with Phone() as phone:  # 从终端运行时，结束后把手机让出来
+    phone.launch_app("com.atebits.Tweetie2", url="https://x.com/user/status/123")
+    phone.tap_text("发布你的回复", timeout_s=10)
+    phone.type_text("不错。")
+```
+
+`phonectl.client` 只用标准库，令牌和服务相同。它的调用和 Agent 一样共用手机：别人在用时排队等待；Agent 收到 `NOT DONE` 的情况，脚本里会抛出 `ScreenChanged`。[`examples/x_reply.py`](examples/x_reply.py) 是一个完整的流程，中途停下时会报告停在哪一步、屏幕上有什么，运行它的 Agent 可以接着处理。
 
 ## 排查问题
 
@@ -136,7 +159,10 @@ claude mcp add --scope user --transport http phone http://127.0.0.1:47321/mcp \
 | `PHONECTL_TOUCH_IDLE` | `30` | 空闲几秒后关闭输入通道（重开约 0.6 秒） |
 | `PHONECTL_KEY_IDLE` | `5` | 几秒没按键后断开虚拟键盘，屏幕键盘随之回来 |
 | `PHONECTL_CALL_TIMEOUT` | `15` | 等手机响应几秒算失败（不含手势耗时） |
-| `PHONECTL_LOG` | `WARNING` | 日志级别（服务为 `INFO`），日志在 `~/Library/Logs/phonectl*.log` |
+| `PHONECTL_IDLE` | `90` | 一个客户端连续几秒没有调用，就算用完了手机 |
+| `PHONECTL_WAIT` | `180` | 调用最多等几秒手机，超时报 `Busy`；要短于客户端自己的工具超时 |
+| `PHONECTL_MAX_HOLD` | `600` | 一个客户端连续占用这么久以后，让排队的客户端先用 |
+| `PHONECTL_LOG` | `WARNING` | 日志级别（服务为 `INFO`，会记下每次调用来自哪个客户端），日志在 `~/Library/Logs/phonectl*.log` |
 
 </details>
 

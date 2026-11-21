@@ -4,6 +4,7 @@
     phonectl uninstall-service   stop it and remove the launchd job
     phonectl restart             restart it, e.g. after upgrading
     phonectl doctor [--fix]      check every link from the cable to the server, say what to do
+    phonectl hold 30m | off      keep agents off the phone while you use it by hand
 """
 
 from __future__ import annotations
@@ -350,6 +351,34 @@ def doctor(args) -> int:
     return asyncio.run(_doctor(args.fix))
 
 
+def _seconds(text: str) -> float:
+    """'30m', '90s', '1h', '45' (minutes) or 'off' -> seconds."""
+    text = text.strip().lower()
+    if text in ("off", "0"):
+        return 0.0
+    units = {"s": 1, "m": 60, "h": 3600}
+    unit = units.get(text[-1])
+    try:
+        return float(text[:-1]) * unit if unit else float(text) * 60
+    except ValueError:
+        raise SystemExit(f"not a duration: {text!r} (e.g. 30m, 90s, 1h, off)") from None
+
+
+def hold(args) -> int:
+    """Keep agents off the phone while you use it by hand."""
+    from .client import Phone, PhoneError
+
+    _use_service_env()
+    try:
+        with Phone() as phone:
+            use = phone._admin("POST", "hold", {"seconds": _seconds(args.duration)})["use"]
+    except (PhoneError, OSError) as e:
+        print(f"Could not reach the server ({e}); is it running? `phonectl doctor`")
+        return 1
+    print(f"Phone: {use}")
+    return 0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="phonectl", description="Set up and check the phonectl MCP server.")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -359,6 +388,9 @@ def main() -> None:
     d = sub.add_parser("doctor", help="check the phone, the USB link and the server")
     d.add_argument("--fix", action="store_true", help="show the Developer Mode switch in Settings if it is missing")
     d.set_defaults(fn=doctor)
+    h = sub.add_parser("hold", help="keep agents off the phone while you use it (e.g. 30m; off ends it)")
+    h.add_argument("duration", help="how long: 30m, 90s, 1h, or off")
+    h.set_defaults(fn=hold)
     args = ap.parse_args()
     sys.exit(args.fn(args))
 

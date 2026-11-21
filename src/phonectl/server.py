@@ -7,6 +7,7 @@ typing need iOS 27+.
 Run with --http as the one resident server for every client (`phonectl install-service`):
 the phone keeps a single control connection on the native tunnel, so one server process per
 agent session made them evict each other. Without --http it speaks stdio, for one client.
+Clients take turns with the phone (see arbiter): a call waits while another client is using it.
 """
 
 from __future__ import annotations
@@ -15,16 +16,19 @@ import argparse
 import asyncio
 import functools
 import hmac
+import inspect
 import io
 import json
 import logging
 import os
 import secrets
 import time
+import typing
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Literal, Optional
 
-from mcp.server.mcpserver import Image, MCPServer
+from mcp.server.mcpserver import Context, Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from PIL import Image as PILImage
@@ -32,6 +36,7 @@ from PIL import Image as PILImage
 from pymobiledevice3.exceptions import CoreDeviceError
 
 from . import __version__
+from .arbiter import Arbiter, Busy, Client, Lease, identify
 from .device import NORM_MAX, Device, InputUncertain
 from .keys import parse_key
 from .ocr import recognize
@@ -61,31 +66,96 @@ _screen_pt: Optional[tuple[float, float]] = None
 # Held from putting text on the clipboard until it is pasted, so another client's clipboard
 # write cannot land in between and get pasted instead.
 _clipboard_lock = asyncio.Lock()
+arbiter = Arbiter()
+# The client of the tool call being served (for status).
+_caller: ContextVar[Client] = ContextVar("phonectl_caller")
 
 
 # Failures whose message says everything; anything else is a bug here and is logged in full.
-_EXPECTED = (ValueError, ConnectionError, OSError, InputUncertain, CoreDeviceError)
+_EXPECTED = (ValueError, ConnectionError, OSError, InputUncertain, CoreDeviceError, Busy)
 
 
-def _tool(fn):
-    """mcp.tool(), but a failure reaches the client with its cause.
+# How a tool uses the phone, which decides how it is shared (see arbiter):
+FREE = "free"  # does not touch the screen: never waits
+LOOK = "look"  # reads the screen; afterwards the caller's view of it is current
+AIMED = "aimed"  # input that finds its own target on the screen (by text): the view is current
+NAV = "nav"  # input that needs no target (an app, a button); the view is current only with a screenshot
+BLIND = "blind"  # input at coordinates or into the focused field, aimed from an earlier look
+CLIP = "clip"  # the clipboard, which other clients' typing goes through too
+
+
+def _request(ctx: Context):
+    """The HTTP request behind a call; None on stdio or when called directly (tests)."""
+    try:
+        return ctx.request_context.request
+    except ValueError:  # "Context is not available outside of a request"
+        return None
+
+
+async def _client(ctx: Context) -> Client:
+    req = _request(ctx)
+    client = getattr(req, "client", None)
+    name = req.headers.get("x-phonectl-client") if req is not None else None
+    return (await identify(arbiter, (client.host, client.port) if client else None, name))[0]
+
+
+def _tool(kind: str):
+    """mcp.tool(), but the phone is shared between clients and a failure reaches the client
+    with its cause.
 
     The MCP SDK reports any exception other than ToolError as a bare "Error executing tool
     X", which hides whether the phone is gone, the input was rejected or the app refused.
     """
 
-    @functools.wraps(fn)
-    async def run(*args, **kwargs):
-        try:
-            return await fn(*args, **kwargs)
-        except ToolError:
-            raise
-        except Exception as e:
-            if not isinstance(e, _EXPECTED):
-                log.exception("tool %s failed", fn.__name__)
-            raise ToolError(f"{type(e).__name__}: {e}") from e
+    def register(fn):
+        # Annotations evaluated: the SDK reads a preset __signature__ as it is, strings and all.
+        sig = inspect.signature(fn, eval_str=True)
 
-    return mcp.tool()(run)
+        @functools.wraps(fn)
+        async def run(*args, ctx: Context, **kwargs):
+            try:
+                client = await _client(ctx)
+                _caller.set(client)
+                if kind == FREE:
+                    return await fn(*args, **kwargs)
+                log.info("%s: %s", client.label, fn.__name__)
+                async with arbiter.use(client) as lease:
+                    call = sig.bind(*args, **kwargs)
+                    call.apply_defaults()
+                    shot = call.arguments.get("screenshot", False)
+                    if kind == BLIND and lease.stale_by:
+                        return await _not_done(lease, shot)
+                    result = await fn(*args, **kwargs)
+                    if kind in (LOOK, AIMED) or (kind == NAV and shot):
+                        arbiter.saw_screen(lease)
+                    return result
+            except ToolError:
+                raise
+            except Exception as e:
+                if not isinstance(e, _EXPECTED):
+                    log.exception("tool %s failed", fn.__name__)
+                raise ToolError(f"{type(e).__name__}: {e}") from e
+
+        # The SDK finds the Context parameter by its annotation and leaves it out of the schema.
+        ctx_param = inspect.Parameter("ctx", inspect.Parameter.KEYWORD_ONLY, annotation=Context)
+        run.__signature__ = sig.replace(parameters=[*sig.parameters.values(), ctx_param])
+        run.__annotations__ = {**typing.get_type_hints(fn), "ctx": Context}
+        return mcp.tool()(run)
+
+    return register
+
+
+async def _not_done(lease: Lease, screenshot: bool) -> list[str | Image]:
+    """The answer to a blind input from a client whose view of the screen is out of date."""
+    note = (f"NOT DONE: {lease.stale_by} used the phone after you last looked at the screen, so it may show "
+            "something else now; nothing was sent. Look at the screen"
+            + (" (attached)" if screenshot else " (screenshot or read_text)")
+            + " and repeat the call if it still applies.")
+    if not screenshot:
+        return [note]
+    img = await _capture()
+    arbiter.saw_screen(lease)
+    return [note, img]
 
 
 async def _capture() -> Image:
@@ -166,7 +236,7 @@ async def _wait_lines(text: str, timeout_s: float, gone: bool = False) -> list[d
         await asyncio.sleep(POLL_S)
 
 
-@_tool
+@_tool(LOOK)
 async def screenshot(native: bool = False) -> list[str | Image]:
     """Capture the iPhone screen. The image is in iOS points; use its pixel coordinates directly in tap/swipe.
     native=True is for scripts (OCR, saving to a file): the full-resolution PNG, SCALE pixels per point.
@@ -178,7 +248,7 @@ async def screenshot(native: bool = False) -> list[str | Image]:
     return [f"screen {_screen_pt[0]:g}x{_screen_pt[1]:g} points", img]
 
 
-@_tool
+@_tool(LOOK)
 async def read_text() -> str:
     """Read the text on the iPhone screen (Apple Vision OCR, Chinese and English) without an image.
     Returns a JSON array of lines {"t": text, "x": cx, "y": cy, "w": w, "h": h}, the box centre
@@ -186,7 +256,7 @@ async def read_text() -> str:
     return json.dumps(await _read_lines(), ensure_ascii=False)
 
 
-@_tool
+@_tool(LOOK)
 async def wait_text(text: str, timeout_s: float = 10, gone: bool = False) -> str:
     """Wait until text appears on the screen (a substring of an OCR line), or with gone=True until
     it is no longer there (e.g. a loading message). Looks about twice a second, at least once.
@@ -195,7 +265,7 @@ async def wait_text(text: str, timeout_s: float = 10, gone: bool = False) -> str
     return json.dumps(await _wait_lines(text, timeout_s, gone), ensure_ascii=False)
 
 
-@_tool
+@_tool(AIMED)
 async def tap_text(text: str, timeout_s: float = 0, screenshot: bool = True,
                    settle_ms: Optional[int] = None) -> list[str | Image]:
     """Find text on the screen by OCR and tap its centre. With timeout_s, waits up to that long
@@ -214,7 +284,7 @@ async def tap_text(text: str, timeout_s: float = 0, screenshot: bool = True,
     return await _after(f"tapped {hits[0]['t']!r} at ({x:g}, {y:g})", screenshot, settle_ms)
 
 
-@_tool
+@_tool(BLIND)
 async def tap(x: float, y: float, screenshot: bool = True, settle_ms: Optional[int] = None) -> list[str | Image]:
     """Tap at (x, y) in points. Returns a screenshot taken after the tap unless screenshot=False.
     Taps are not confirmed by the phone: check the screenshot to see whether it landed.
@@ -226,7 +296,7 @@ async def tap(x: float, y: float, screenshot: bool = True, settle_ms: Optional[i
     return await _after(f"tapped ({x:g}, {y:g})", screenshot, settle_ms)
 
 
-@_tool
+@_tool(BLIND)
 async def long_press(x: float, y: float, duration_ms: int = 800, screenshot: bool = True,
                      settle_ms: Optional[int] = None) -> list[str | Image]:
     """Press and hold at (x, y) in points for duration_ms."""
@@ -234,7 +304,7 @@ async def long_press(x: float, y: float, duration_ms: int = 800, screenshot: boo
     return await _after(f"long-pressed ({x:g}, {y:g}) for {duration_ms} ms", screenshot, settle_ms)
 
 
-@_tool
+@_tool(BLIND)
 async def swipe(x1: float, y1: float, x2: float, y2: float, duration_ms: int = 300, screenshot: bool = True,
                 settle_ms: Optional[int] = None) -> list[str | Image]:
     """Drag from (x1, y1) to (x2, y2) in points over duration_ms. Scroll down = swipe upward.
@@ -243,7 +313,7 @@ async def swipe(x1: float, y1: float, x2: float, y2: float, duration_ms: int = 3
     return await _after(f"swiped ({x1:g}, {y1:g}) -> ({x2:g}, {y2:g})", screenshot, settle_ms)
 
 
-@_tool
+@_tool(BLIND)
 async def type_text(text: str, method: Literal["paste", "keys"] = "paste", screenshot: bool = True,
                     settle_ms: Optional[int] = None) -> list[str | Image]:
     """Type text into the focused field (tap the field first). The text is put on the iPhone
@@ -263,7 +333,7 @@ async def type_text(text: str, method: Literal["paste", "keys"] = "paste", scree
     return await _after(f"{how} {len(text)} characters", screenshot, settle_ms)
 
 
-@_tool
+@_tool(BLIND)
 async def press_key(key: str, screenshot: bool = True, settle_ms: Optional[int] = None) -> list[str | Image]:
     """Press a keyboard key or chord, e.g. 'enter', 'backspace', 'tab', 'esc', 'up',
     'cmd+a', 'cmd+space' (Spotlight). Modifiers: ctrl, shift, alt, cmd. Keys: a-z, 0-9, enter,
@@ -272,7 +342,7 @@ async def press_key(key: str, screenshot: bool = True, settle_ms: Optional[int] 
     return await _after(f"pressed {key}", screenshot, settle_ms)
 
 
-@_tool
+@_tool(NAV)
 async def press_button(name: str, screenshot: bool = True, settle_ms: Optional[int] = None) -> list[str | Image]:
     """Press an iPhone hardware button over USB: home, lock, volume-up, volume-down, mute, siri.
     'home' returns to the home screen; 'lock' locks the phone."""
@@ -280,16 +350,17 @@ async def press_button(name: str, screenshot: bool = True, settle_ms: Optional[i
     return await _after(f"pressed {name}", screenshot, settle_ms)
 
 
-@_tool
-async def launch_app(bundle_id: str, restart: bool = False, screenshot: bool = True,
-                     settle_ms: Optional[int] = None) -> list[str | Image]:
+@_tool(NAV)
+async def launch_app(bundle_id: str, restart: bool = False, url: Optional[str] = None,
+                     screenshot: bool = True, settle_ms: Optional[int] = None) -> list[str | Image]:
     """Open an app by bundle id (see list_apps). An app already running is brought to the
-    front as it was; restart=True kills it first."""
-    await device.launch_app(bundle_id, restart=restart)
-    return await _after(f"launched {bundle_id}", screenshot, settle_ms)
+    front as it was; restart=True kills it first. url: a link for the app to open, as if
+    tapped (e.g. a post's https://x.com/... link in X), which skips navigating to it."""
+    await device.launch_app(bundle_id, restart=restart, url=url)
+    return await _after(f"launched {bundle_id}" + (f" with {url}" if url else ""), screenshot, settle_ms)
 
 
-@_tool
+@_tool(FREE)
 async def list_apps(query: str = "") -> str:
     """List user-visible apps as 'name  bundle_id', optionally filtered by a substring of either."""
     apps = await device.list_apps()
@@ -302,13 +373,13 @@ async def list_apps(query: str = "") -> str:
     return "\n".join(f"{n}  {b}" for n, b in rows) or "no match"
 
 
-@_tool
+@_tool(CLIP)
 async def get_clipboard() -> str:
     """Read the iPhone clipboard as text."""
     return (await device.get_clipboard()) or ""
 
 
-@_tool
+@_tool(CLIP)
 async def set_clipboard(text: str) -> str:
     """Put text on the iPhone clipboard."""
     async with _clipboard_lock:
@@ -316,10 +387,13 @@ async def set_clipboard(text: str) -> str:
     return "ok"
 
 
-@_tool
+@_tool(FREE)
 async def status() -> str:
-    """Report the server and the USB link to the phone."""
-    lines = [f"server: phonectl-mcp {__version__}, pid {os.getpid()}, up since {_STARTED}, code from {_CODE_STAMP}"]
+    """Report the server, the link to the phone and who is using it. Clients share the phone:
+    while one uses it, another's calls wait (then fail with Busy), so check here first to skip
+    work rather than wait."""
+    lines = [f"server: phonectl-mcp {__version__}, pid {os.getpid()}, up since {_STARTED}, code from {_CODE_STAMP}",
+             f"use: {arbiter.describe(_caller.get(None))}"]
     try:
         await device.screenshot_png()
         lines.append(f"phone: connected over {device.transport} tunnel")
@@ -348,6 +422,46 @@ def _load_token(path: Path) -> str:
     return token
 
 
+_ADMIN = "/phonectl/"
+
+
+async def _admin(scope, receive, send) -> None:
+    """Plain HTTP for the phonectl CLI and scripts, kept out of the MCP tool list so agents do
+    not carry it in their context:
+      GET  /phonectl/use                   who is using the phone
+      POST /phonectl/release               give the phone up now (scripts, when done)
+      POST /phonectl/hold {"seconds": n}   keep every client off it while the person uses it
+    """
+    body = b""
+    while True:
+        msg = await receive()
+        body += msg.get("body", b"")
+        if not msg.get("more_body"):
+            break
+    headers = dict(scope["headers"])
+    name = headers.get(b"x-phonectl-client", b"").decode() or None
+    client, own = await identify(arbiter, scope.get("client"), name)
+    route = (scope["method"], scope["path"][len(_ADMIN):])
+    status, out = 200, {}
+    try:
+        if route == ("GET", "use"):
+            out = {"use": arbiter.describe(client)}
+        elif route == ("POST", "release"):
+            # A script started by the client that holds the phone is that client's own action,
+            # so it ending is not the client being done with the phone.
+            out = {"released": own and await arbiter.release(client)}
+        elif route == ("POST", "hold"):
+            await arbiter.hold_for_person(float(json.loads(body or b"{}").get("seconds", 0)))
+            out = {"use": arbiter.describe(client)}
+        else:
+            status, out = 404, {"error": f"no {route[0]} {scope['path']}"}
+    except (ValueError, TypeError, AttributeError) as e:  # a malformed body
+        status, out = 400, {"error": str(e)}
+    await send({"type": "http.response.start", "status": status,
+                "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "http.response.body", "body": json.dumps(out, ensure_ascii=False).encode()})
+
+
 class _BearerAuth:
     """ASGI middleware: refuse any connection without the token. Only lifespan events pass."""
 
@@ -370,6 +484,9 @@ class _BearerAuth:
                                         (b"www-authenticate", b'Bearer realm="phonectl"')]})
                 await send({"type": "http.response.body", "body": b"unauthorized\n"})
             return
+        if scope["type"] == "http" and scope.get("path", "").startswith(_ADMIN):
+            await _admin(scope, receive, send)
+            return
         if scope["type"] == "http" and scope["method"] == "GET":
             # The GET stream only carries messages the server starts, and a stateless server
             # never starts any. Refusing it (the spec allows 405) leaves no connection open
@@ -383,6 +500,8 @@ class _BearerAuth:
 
 def _serve_http() -> None:
     import uvicorn
+
+    arbiter.assume_used_before()  # clients may have used the phone through a server before this one
 
     hosts = [f"{HTTP_HOST}:{HTTP_PORT}", f"localhost:{HTTP_PORT}"]
     app = mcp.streamable_http_app(
