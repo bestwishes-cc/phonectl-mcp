@@ -106,23 +106,41 @@ claude mcp add --scope user --transport http phone http://127.0.0.1:47321/mcp \
 连到服务的客户端共用这台手机，轮流使用：一个客户端开始用手机后，就一直占着，直到它连续 90 秒没有调用。这期间别的客户端的调用会排队等待（最多 180 秒，超时报 `Busy`），不会落到对方的屏幕上。等到手机空出来，等待的 Agent 会自己接着做，等待期间不消耗 token。`status` 会显示谁在用手机。
 
 - 服务按进程区分客户端：一个 Claude Code 会话和它的子 Agent 算一个客户端。Agent 运行的脚本算作这个 Agent 本人，不用等它，也不会把手机从它手里拿走；从终端直接运行的脚本是一个单独的客户端。一个进程里跑几个互不相干的任务时，每个任务发送请求头 `X-Phonectl-Client: <名字>`。客户端的进程一退出，手机马上空出来。
-- 只有在别人用过手机之后、这个客户端又看过屏幕，它的点按、滑动、打字、按键才会发出。否则结果里写着 `NOT DONE`（除非传了 `screenshot=False`，否则附一张当前截图），什么都不发。服务启动后每个客户端的第一次这类操作也是如此，因为服务不知道之前谁用过手机。`tap_text`、`launch_app`、`press_button` 不依赖旧坐标，总是照常执行。
+- 只有在别人用过手机之后、这个客户端又看过屏幕，它的点按、滑动、打字、按键才会发出。否则这次调用返回错误 `NOT DONE`，什么都不发；先看一眼屏幕，再决定要不要重做。服务启动后每个客户端的第一次这类操作也是如此，因为服务不知道之前谁用过手机。`tap_text`、`launch_app`、`press_button` 不依赖旧坐标，总是照常执行。
 - 服务看不到你本人在用手机：`phonectl hold 30m` 让各个 Agent 让开，`phonectl hold off` 结束。
 
 ## 脚本
 
-步骤固定的流程（找到帖子、点回复框、粘贴、发送）不需要模型在每一步之间思考。写成脚本后，Agent 只需要运行一条命令，不再每一步都和模型往返一次：
+步骤固定的流程不需要模型在每一步之间思考。写成脚本后，Agent 只需要运行一条命令，不再每一步都和模型往返一次。脚本就是这个服务的又一个 MCP 客户端，用哪个 MCP 库都行。用官方 Python SDK 的写法：
 
 ```python
-from phonectl.client import Phone
+# /// script
+# dependencies = ["mcp>=2.3,<3"]
+# ///
+import asyncio, json
+from pathlib import Path
+from mcp.client.session import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+from mcp.shared._httpx_utils import create_mcp_http_client
 
-with Phone() as phone:  # 从终端运行时，结束后把手机让出来
-    phone.launch_app("com.atebits.Tweetie2", url="twitter://search?query=from%3Asomeone")
-    phone.tap_text("最新", timeout_s=10)
-    print([line["t"] for line in phone.read_text()])
+async def main():
+    token = (Path.home() / ".config/phonectl/token").read_text().strip()
+    http = create_mcp_http_client(headers={"Authorization": f"Bearer {token}"})
+    async with streamable_http_client("http://127.0.0.1:47321/mcp", http_client=http) as (read, write, *_):
+        async with ClientSession(read, write) as phone:
+            await phone.initialize()
+            for tool, args in [("launch_app", {"bundle_id": "com.apple.Preferences", "restart": True}),
+                               ("tap_text", {"text": "无线局域网", "timeout_s": 5, "settle_ms": 1000}),
+                               ("read_text", {})]:
+                result = await phone.call_tool(tool, {**args, "screenshot": False} if tool != "read_text" else args)
+                if result.is_error:  # Busy、NOT DONE、手机断开：停下，不要往下走
+                    return f"{tool}: {result.content[0].text}"
+            return [line["t"] for line in json.loads(result.content[0].text)]
+
+print(asyncio.run(main()))
 ```
 
-`phonectl.client` 只用标准库，令牌和服务相同。它的调用和 Agent 一样共用手机：别人在用时排队等待；Agent 收到 `NOT DONE` 的情况，脚本里会抛出 `ScreenChanged`。
+用 `uv run script.py` 运行。它的调用和 Agent 一样共用手机：别人在用时排队等待；被拒绝的调用返回错误结果；脚本一退出，手机马上空出来。
 
 ## 排查问题
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import platform
 import plistlib
@@ -357,7 +358,7 @@ def _seconds(text: str) -> float:
     if text in ("off", "0"):
         return 0.0
     units = {"s": 1, "m": 60, "h": 3600}
-    unit = units.get(text[-1])
+    unit = units.get(text[-1:])
     try:
         return float(text[:-1]) * unit if unit else float(text) * 60
     except ValueError:
@@ -366,13 +367,25 @@ def _seconds(text: str) -> float:
 
 def hold(args) -> int:
     """Keep agents off the phone while you use it by hand."""
-    from .client import Phone, PhoneError
+    import urllib.error
+    import urllib.request
 
     _use_service_env()
+    srv = _server_settings()
+    seconds = _seconds(args.duration)
     try:
-        with Phone() as phone:
-            use = phone._admin("POST", "hold", {"seconds": _seconds(args.duration)})["use"]
-    except (PhoneError, OSError) as e:
+        req = urllib.request.Request(
+            f"http://{srv.HTTP_HOST}:{srv.HTTP_PORT}/phonectl/hold", method="POST",
+            data=json.dumps({"seconds": seconds}).encode(),
+            headers={"Authorization": f"Bearer {srv.TOKEN_PATH.read_text().strip()}",
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            use = json.loads(r.read())["use"]
+    except urllib.error.HTTPError as e:
+        print(f"The server refused the request ({e.code} {e.reason}); "
+              f"is {srv.TOKEN_PATH} the token it uses? `phonectl doctor`")
+        return 1
+    except OSError as e:  # an unreachable server or a missing token file
         print(f"Could not reach the server ({e}); is it running? `phonectl doctor`")
         return 1
     print(f"Phone: {use}")

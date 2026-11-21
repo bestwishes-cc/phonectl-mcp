@@ -106,23 +106,41 @@ Tools that act on the phone return a screenshot taken afterwards (`screenshot=Fa
 All clients of the server share the phone, and they take turns: a client that starts using it keeps it until it has made no call for 90 s. A call from another client meanwhile waits (up to 180 s, then it fails with `Busy`) instead of landing on the other agent's screen. The waiting agent then carries on by itself, and waiting costs it no tokens. `status` says who has the phone.
 
 - Clients are told apart by their process: a Claude Code session and its subagents are one client. A script that an agent runs counts as that agent, so it neither waits for the agent nor takes the phone from it; a script started from a terminal is a client of its own. A process that runs several independent tasks sends a header `X-Phonectl-Client: <name>` per task. When a client's process exits, the phone is free at once.
-- A tap, swipe, typing or key press is sent only if the client has looked at the screen since anyone else used the phone. Otherwise the result says `NOT DONE` (with a fresh screenshot unless `screenshot=False`) and nothing is sent. This also holds for a client's first such input after the server starts, since the server cannot know who used the phone before. `tap_text`, `launch_app` and `press_button` need no old coordinates and are always sent.
+- A tap, swipe, typing or key press is sent only if the client has looked at the screen since anyone else used the phone. Otherwise the call fails with `NOT DONE` and nothing is sent; look at the screen and repeat it. This also holds for a client's first such input after the server starts, since the server cannot know who used the phone before. `tap_text`, `launch_app` and `press_button` need no old coordinates and are always sent.
 - The server cannot see you using the phone by hand: `phonectl hold 30m` keeps agents off it, `phonectl hold off` ends that.
 
 ## Scripts
 
-A fixed sequence (find a post, tap the reply field, paste, send) does not need a model to think between the steps. As a script, it is one command for the agent instead of one model round trip per step:
+A fixed sequence of steps does not need a model to think between them. As a script, it is one command for the agent instead of one model round trip per step. A script is just another MCP client of the same server, on any MCP library; with the official Python SDK:
 
 ```python
-from phonectl.client import Phone
+# /// script
+# dependencies = ["mcp>=2.3,<3"]
+# ///
+import asyncio, json
+from pathlib import Path
+from mcp.client.session import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+from mcp.shared._httpx_utils import create_mcp_http_client
 
-with Phone() as phone:  # run from a terminal, it gives the phone up at the end
-    phone.launch_app("com.atebits.Tweetie2", url="twitter://search?query=from%3Asomeone")
-    phone.tap_text("Latest", timeout_s=10)
-    print([line["t"] for line in phone.read_text()])
+async def main():
+    token = (Path.home() / ".config/phonectl/token").read_text().strip()
+    http = create_mcp_http_client(headers={"Authorization": f"Bearer {token}"})
+    async with streamable_http_client("http://127.0.0.1:47321/mcp", http_client=http) as (read, write, *_):
+        async with ClientSession(read, write) as phone:
+            await phone.initialize()
+            for tool, args in [("launch_app", {"bundle_id": "com.apple.Preferences", "restart": True}),
+                               ("tap_text", {"text": "Wi-Fi", "timeout_s": 5, "settle_ms": 1000}),
+                               ("read_text", {})]:
+                result = await phone.call_tool(tool, {**args, "screenshot": False} if tool != "read_text" else args)
+                if result.is_error:  # Busy, NOT DONE, the phone gone: stop instead of carrying on
+                    return f"{tool}: {result.content[0].text}"
+            return [line["t"] for line in json.loads(result.content[0].text)]
+
+print(asyncio.run(main()))
 ```
 
-`phonectl.client` uses only the standard library and the same token. Its calls share the phone like an agent's: they wait while another client has it, and `ScreenChanged` is raised where an agent would get `NOT DONE`.
+Run it with `uv run script.py`. Its calls share the phone like an agent's: they wait while another client has it, a refused call is an error result, and the phone is free as soon as the script exits.
 
 ## Troubleshooting
 

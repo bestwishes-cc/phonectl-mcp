@@ -31,6 +31,7 @@ from typing import Literal, Optional
 from mcp.server.mcpserver import Context, Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp_types import CallToolResult, TextContent
 from PIL import Image as PILImage
 
 from pymobiledevice3.exceptions import CoreDeviceError
@@ -60,7 +61,10 @@ _CODE_STAMP = time.strftime(
     time.localtime(max(p.stat().st_mtime for p in Path(__file__).parent.glob("*.py"))),
 )
 
-mcp = MCPServer("phonectl")
+mcp = MCPServer("phonectl", instructions=(
+    "One server shared by every agent and script that uses this phone. A script drives the phone "
+    "by calling these same tools on this server with any MCP client (same URL, same token); never "
+    "connect to the phone directly, which cuts this server off from it."))
 device = Device(os.environ.get("PHONECTL_UDID") or None)
 _screen_pt: Optional[tuple[float, float]] = None
 # Held from putting text on the clipboard until it is pasted, so another client's clipboard
@@ -124,7 +128,7 @@ def _tool(kind: str):
                     call.apply_defaults()
                     shot = call.arguments.get("screenshot", False)
                     if kind == BLIND and lease.stale_by:
-                        return await _not_done(lease, shot)
+                        return _not_done(lease)
                     result = await fn(*args, **kwargs)
                     if kind in (LOOK, AIMED) or (kind == NAV and shot):
                         arbiter.saw_screen(lease)
@@ -145,17 +149,17 @@ def _tool(kind: str):
     return register
 
 
-async def _not_done(lease: Lease, screenshot: bool) -> list[str | Image]:
-    """The answer to a blind input from a client whose view of the screen is out of date."""
+def _not_done(lease: Lease) -> CallToolResult:
+    """The answer to a blind input from a client whose view of the screen is out of date.
+
+    An error result, so that a script on any MCP client stops instead of going on as if the
+    input had landed. It carries no screenshot and does not count as a look: some clients drop
+    the images of an error result, and a client that never saw the screen must not be let
+    through on its next blind input."""
     note = (f"NOT DONE: {lease.stale_by} used the phone after you last looked at the screen, so it may show "
-            "something else now; nothing was sent. Look at the screen"
-            + (" (attached)" if screenshot else " (screenshot or read_text)")
-            + " and repeat the call if it still applies.")
-    if not screenshot:
-        return [note]
-    img = await _capture()
-    arbiter.saw_screen(lease)
-    return [note, img]
+            "something else now; nothing was sent. Look at the screen (screenshot or read_text) and "
+            "repeat the call if it still applies.")
+    return CallToolResult(content=[TextContent(type="text", text=note)], is_error=True)
 
 
 async def _capture() -> Image:

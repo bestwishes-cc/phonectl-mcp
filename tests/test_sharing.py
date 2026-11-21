@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from phonectl.client import Busy, Phone, ScreenChanged
+from http_client import Busy, Phone, ScreenChanged
 
 HERE = Path(__file__).parent
 IDLE_S = 1.0
@@ -32,7 +32,8 @@ def srv(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("srv")
     port = _free_port()
     env = {**os.environ, "PHONECTL_PORT": str(port), "PHONECTL_TOKEN_FILE": str(tmp / "token"),
-           "PHONECTL_IDLE": str(IDLE_S), "PHONECTL_WAIT": str(WAIT_S), "PHONECTL_LOG": "INFO"}
+           "PHONECTL_IDLE": str(IDLE_S), "PHONECTL_WAIT": str(WAIT_S), "PHONECTL_LOG": "INFO",
+           "PYTHONPATH": str(HERE)}  # client scripts in other processes import http_client
     log = tmp / "inputs"
     proc = subprocess.Popen([sys.executable, str(HERE / "fake_phone.py"), str(log)], env=env,
                             stdout=subprocess.DEVNULL, stderr=open(tmp / "server.log", "w"))
@@ -68,7 +69,7 @@ def _phone(srv, name):
 
 def _script(srv, body: str) -> subprocess.Popen:
     """A client in its own process; it prints what happened."""
-    code = "from phonectl.client import *\nimport time\n" + textwrap.dedent(body)
+    code = "from http_client import *\nimport time\n" + textwrap.dedent(body)
     return subprocess.Popen([sys.executable, "-c", code], env=srv.env, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
@@ -158,7 +159,7 @@ def test_the_log_names_the_client_of_each_call(srv):
 def test_a_script_started_by_a_client_counts_as_that_client(srv):
     # An agent that runs a flow script (or a screenshot helper) is acting itself: the script
     # must not wait for the agent's idle time, and the agent's next tap is not stale after it.
-    child = (f"from phonectl.client import Phone; import time; t = time.monotonic(); c = Phone(port={srv.port}); "
+    child = (f"from http_client import Phone; import time; t = time.monotonic(); c = Phone(port={srv.port}); "
              f"c.tap(2, 2); print('child waited', round(time.monotonic() - t, 2)); print('released', c.release())")
     parent = _script(srv, f"""
         import subprocess, sys
@@ -198,3 +199,32 @@ def test_the_phone_is_free_as_soon_as_its_holder_exits(srv):
     t0 = time.monotonic()
     b.read_text()
     assert time.monotonic() - t0 < IDLE_S / 2
+
+
+def test_a_script_on_the_official_mcp_client_sees_refusals_as_errors(srv):
+    # A script that knows nothing of phonectl, on the MCP SDK's own client: the input the server
+    # did not send comes back as an error result, so the script cannot take it for done.
+    import asyncio
+
+    from mcp.client.session import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+    from mcp.shared._httpx_utils import create_mcp_http_client
+
+    async def main():
+        http = create_mcp_http_client(headers={"Authorization": f"Bearer {srv.token}",
+                                               "X-Phonectl-Client": "sdk-script"})
+        async with streamable_http_client(f"http://127.0.0.1:{srv.port}/mcp", http_client=http) as (r, w, *_):
+            async with ClientSession(r, w) as s:
+                await s.initialize()
+                first = await s.call_tool("tap", {"x": 1, "y": 1, "screenshot": True})
+                again = await s.call_tool("tap", {"x": 1, "y": 1, "screenshot": False})
+                await s.call_tool("read_text", {})
+                after_look = await s.call_tool("tap", {"x": 1, "y": 1, "screenshot": False})
+                return first, again, after_look
+
+    first, again, after_look = asyncio.run(main())
+    assert first.is_error and first.content[0].text.startswith("NOT DONE:")
+    # No screenshot in the refusal, and it is not a look: the next blind tap is refused too.
+    assert [c.type for c in first.content] == ["text"]
+    assert again.is_error
+    assert not after_look.is_error

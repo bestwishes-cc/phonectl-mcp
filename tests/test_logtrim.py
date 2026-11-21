@@ -39,3 +39,15 @@ def test_a_pipe_is_left_alone():
     finally:
         os.close(r)
         os.close(w)
+
+
+def test_a_log_not_open_for_appending_is_left_alone(tmp_path):
+    # Emptied, it would be written on at the old offset, behind a run of NULs.
+    path = tmp_path / "out.log"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT)  # a shell's `>`
+    try:
+        os.write(fd, b"line\n" * 40)
+        assert not logtrim.trim(fd, max_bytes=100)
+    finally:
+        os.close(fd)
+    assert path.read_bytes() == b"line\n" * 40

@@ -2,8 +2,9 @@
 
 launchd opens the files for the server's stdout and stderr (for appending) and hands them over,
 so the server cannot reopen them under a new name. Instead, when one grows past MAX_BYTES, the
-server copies it to <file>.1, replacing the older copy, and empties it in place; later writes
-are appends, so they start again at the top. At most about twice MAX_BYTES per file is kept.
+server copies it to <file>.1, replacing the older copy, and empties it in place; launchd opens
+them for appending, so later writes start again at the top. A file not open for appending (a
+shell's `>`) is left alone. At most about twice MAX_BYTES per file is kept.
 Lines written between the copy and the emptying are lost; that is a few milliseconds.
 """
 
@@ -33,13 +34,18 @@ def _path(fd: int) -> str | None:
 
 
 def trim(fd: int, max_bytes: int = MAX_BYTES) -> bool:
-    """If fd is a regular file larger than max_bytes, keep its contents as <file>.1 and empty
-    it. True if it did. A terminal or pipe (the stdio server's stderr) is left alone."""
+    """If fd is a regular file open for appending and larger than max_bytes, keep its contents as
+    <file>.1 and empty it. True if it did. A terminal or pipe (the stdio server's stderr) is left
+    alone."""
     try:
         st = os.fstat(fd)
     except OSError:
         return False
     if not stat.S_ISREG(st.st_mode) or st.st_size <= max_bytes:
+        return False
+    if not fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_APPEND:
+        # Emptied, a file written at its own offset would go on past the end, behind a run of NULs
+        # (a shell's `>`, not launchd): leave it to whoever opened it.
         return False
     path = _path(fd)
     if path is None:

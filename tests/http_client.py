@@ -1,21 +1,13 @@
-"""Drive the phone from a Python script through the resident server, with no model in the loop.
+"""A small synchronous client for the tests: calls the server's tools over HTTP the way a
+script in another process would, with only the standard library.
 
-A fixed sequence (open a post, tap the reply field, paste, send) run as a script takes one
-command from an agent instead of one model round trip per step. The script shares the phone
-like any other client: its calls wait while someone else is using it. A script started from
-a terminal is a client of its own and gives the phone up as soon as it is done; one that an
-agent runs counts as that agent, which keeps the phone.
+    from http_client import Phone
 
-    from phonectl.client import Phone
+    with Phone(port=port, token=token) as phone:
+        phone.read_text()
+        phone.tap(10, 10)
 
-    with Phone() as phone:
-        phone.launch_app("com.apple.Preferences")
-        phone.tap_text("General", timeout_s=5)
-        print(phone.read_text())
-
-Only the standard library is used, so a script can import this from any Python that has the
-package, and the server's own environment is not needed. Input calls never ask the server for
-a screenshot; use read_text / wait_text to check the screen.
+Refusals become exceptions: Busy, ScreenChanged (NOT DONE), TextTimeout, PhoneError.
 """
 
 from __future__ import annotations
@@ -120,10 +112,9 @@ class Phone:
         text = "".join(c.get("text", "") for c in content if c.get("type") == "text")
         if result.get("isError"):
             cause = _SDK_PREFIX.sub("", text)  # the error's own "Type: message"
-            kind = Busy if cause.startswith("Busy:") else TextTimeout if cause.startswith("TimeoutError:") else PhoneError
+            kind = (Busy if cause.startswith("Busy:") else TextTimeout if cause.startswith("TimeoutError:")
+                    else ScreenChanged if cause.startswith("NOT DONE:") else PhoneError)
             raise kind(cause)
-        if text.startswith("NOT DONE:"):
-            raise ScreenChanged(text)
         return content
 
     def _text(self, tool: str, **arguments: Any) -> str:
