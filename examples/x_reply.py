@@ -9,9 +9,10 @@ sending it. (X ignores post links handed to it at launch: twitter://status and h
 leave it on the home timeline, while twitter://search works.) An agent that would otherwise take
 twenty-odd model round trips for this runs one command and reads one line.
 
-It prints one JSON line and exits 0 when the reply went out (or the dry run reached the send
-button), 1 when it stopped: the line says at which step and what text was on the screen, so
-the agent that ran it can look and take over from there. The phone is shared: the script
+It prints one JSON line and exits 0 when the reply went out ("sent") or the dry run reached
+the send button ("dry_run"). Otherwise it exits 1 with "not_found" (no such post in the
+search), "restricted" (the author limits who can reply) or "failed": the line says at which
+step and what text was on the screen, so the agent that ran it can look and take over. The phone is shared: the script
 waits while another client is using it and gives it up when done.
 """
 
@@ -30,6 +31,7 @@ X = "com.atebits.Tweetie2"
 # The app shows Chinese or English depending on the phone's language.
 REPLY_FIELD = ("发布你", "Post your reply")  # OCR at times drops the 的 of 发布你的回复
 LATEST = ("最新", "Latest")  # a tab of the search results, above the posts
+NO_RESULTS = ("没有搜索到结果", "No results for")
 RESTRICTED = ("可以回复", "can reply")  # "只有部分账号可以回复", "Only some accounts can reply"
 REPLY_BOX = ("回复 @", "Replying to")  # over the text field once the reply box is open
 SEND = ("回复", "Reply")
@@ -61,18 +63,34 @@ def wait_any(phone: Phone, texts: tuple[str, ...], timeout_s: float) -> tuple[st
         time.sleep(0.2)
 
 
+def search_words(words: str) -> str:
+    """words without what breaks an X phrase search: emoji, colons and other symbols."""
+    return " ".join(re.sub(r"[^\w\s'.,!?-]", " ", words).split())
+
+
 def find_post(lines: list[dict], words: str) -> dict | None:
-    """The line of a search result (below the result tabs) that begins the post's text."""
-    tabs = [line["y"] for line in lines if line["t"].strip() in LATEST]
+    """The line of a search result (below the result tabs) that begins the post's text.
+    OCR reads the tabs as one line ("最新用户视频") or as several ("最新"), so look for the tab
+    word in a line, but not in a line that holds the words searched for (the search field)."""
     want = _norm(words)[:16]
-    return next((line for line in lines if tabs and line["y"] > tabs[0] and want and
+    if not want:
+        return None
+    tabs = [line["y"] for line in lines
+            if any(t in line["t"] for t in LATEST) and want not in _norm(line["t"])]
+    if not tabs:
+        return None
+    return next((line for line in lines if line["y"] > min(tabs) and
                  (want in _norm(line["t"]) or _norm(line["t"]) in want and len(_norm(line["t"])) >= 6)), None)
 
 
 def wait_post(phone: Phone, words: str, timeout_s: float) -> dict | None:
     deadline = time.monotonic() + timeout_s
     while True:
-        hit = find_post(phone.read_text(), words)
+        lines = phone.read_text()
+        screen = "".join(line["t"] for line in lines).replace(" ", "")
+        if any(t.replace(" ", "") in screen for t in NO_RESULTS):
+            return None  # OCR may split that message over lines; it quotes the words searched for
+        hit = find_post(lines, words)
         if hit or time.monotonic() >= deadline:
             return hit
         time.sleep(0.2)
@@ -91,11 +109,12 @@ def _steps(phone: Phone, url: str, words: str, reply: str, dry_run: bool, progre
     path = urlparse(url).path.strip("/").split("/")
     if len(path) < 3 or path[1] != "status":
         raise Stop("failed", step, f"not a post link: {url}")
+    words = search_words(words)
     query = f'from:{path[0]} "{words}"'
     phone.launch_app(X, url="twitter://search?query=" + quote(query))
     hit = wait_post(phone, words, 10)
     if hit is None:
-        raise Stop("failed", step, f"no search result with the post's words for {query}")
+        raise Stop("not_found", step, f"no post found with {query}")
 
     progress["step"] = step = "open the post"
     found = None
@@ -152,7 +171,8 @@ def _steps(phone: Phone, url: str, words: str, reply: str, dry_run: bool, progre
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("url", help="the post's link, https://x.com/<user>/status/<id>")
-    ap.add_argument("words", help="a few words from the start of the post, to find it with")
+    ap.add_argument("words", help="a few words from the start of the post, to find it with "
+                    "(emoji and symbols are left out of the search)")
     ap.add_argument("reply", help="the reply text, pasted as it is")
     ap.add_argument("--dry-run", action="store_true", help="do everything but send")
     args = ap.parse_args()
