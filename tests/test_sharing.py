@@ -113,6 +113,7 @@ def test_inputs_that_need_no_old_coordinates_are_sent_after_losing_the_phone(srv
     a, b = _phone(srv, "agent-c"), _phone(srv, "agent-d")
     a.read_text()
     b.read_text()
+    b.tap(4, 4)  # b changes the screen
     sent = len(srv.inputs.read_text().splitlines())
     a.launch_app("com.apple.Preferences")  # needs no target on the screen: sent
     a.press_button("home")
@@ -134,6 +135,7 @@ def test_waiting_when_the_person_holds_the_phone(srv):
         assert "call tap again now with the same arguments" in str(w.value)
     finally:
         a._admin("POST", "hold", {"seconds": 0})
+    a.read_text()  # calls again, as told: its kept place is used, and holds up no later test
 
 
 def test_a_call_its_client_cancelled_while_waiting_is_never_sent(srv):
@@ -166,6 +168,7 @@ def _try(fn, *args):
 def test_a_script_yields_between_units_to_a_waiting_client(srv):
     a = _phone(srv, "agent-n")
     a.read_text()
+    a.tap(1, 1)  # a has changed the screen: it holds the phone until it pauses or yields
     assert a._admin("POST", "yield") == {"yielded": False}  # nobody waits
     b = _script(srv, f"""
         p = Phone(name="agent-o", port={srv.port}); t = time.monotonic()
@@ -189,6 +192,7 @@ def test_release_hands_the_phone_over_at_once(srv):
 def test_status_tells_who_has_the_phone(srv):
     a, b = _phone(srv, "agent-h"), _phone(srv, "agent-i")
     a.read_text()
+    a.tap(1, 1)
     assert "use: in use by you" in a._text("status")
     assert "use: in use by agent-h" in b._text("status")
 
@@ -202,14 +206,19 @@ def test_a_script_started_by_a_client_counts_as_that_client(srv):
     # An agent that runs a flow script (or a screenshot helper) is acting itself: the script
     # must not wait for the agent's idle time, and the agent's next tap is not stale after it.
     child = (f"from http_client import Phone; import time; t = time.monotonic(); c = Phone(port={srv.port}); "
-             f"c.tap(2, 2); print('child waited', round(time.monotonic() - t, 2)); print('released', c.release())")
+             f"c.read_text(); c.tap(2, 2); print('child waited', round(time.monotonic() - t, 2)); "
+             f"print('released', c.release())")  # its own process: it looks before its first tap
     parent = _script(srv, f"""
         import subprocess, sys
         p = Phone(port={srv.port})
         p.read_text(); p.tap(1, 1)
         r = subprocess.run([sys.executable, "-c", {child!r}], capture_output=True, text=True)
         print(r.stdout.strip(), r.stderr.strip()[-300:])
-        p.tap(3, 3); print("parent tapped again")
+        try:
+            p.tap(3, 3)
+        except ScreenChanged as e:  # the script tapped: what the parent saw is out of date
+            print("parent told to look:", e)
+        p.read_text(); p.tap(3, 3); print("parent tapped again")
     """)
     out, _ = parent.communicate(timeout=30)
     assert "child waited" in out, out
@@ -217,6 +226,7 @@ def test_a_script_started_by_a_client_counts_as_that_client(srv):
     assert waited < IDLE_S / 2, out
     assert "parent tapped again" in out, out
     assert "released False" in out, out  # the script ending does not give up the parent's phone
+    assert "parent told to look:" in out and "another process of yours" in out, out
 
 
 def test_a_new_client_looks_before_its_first_blind_input(srv):
@@ -270,3 +280,48 @@ def test_a_script_on_the_official_mcp_client_sees_refusals_as_errors(srv):
     assert [c.type for c in first.content] == ["text"]
     assert again.is_error
     assert not after_look.is_error
+
+
+def test_text_taps_need_a_look_or_the_clients_own_app_after_someone_changed_the_screen(srv):
+    from http_client import TextTimeout
+
+    a, b = _phone(srv, "agent-p"), _phone(srv, "agent-q")
+    a.read_text()
+    b.read_text()
+    b.tap(1, 1)  # b changes the screen
+    with pytest.raises(ScreenChanged):
+        a.tap_text("OK")  # "OK" may now be a button in b's app
+    a.launch_app("com.example.mine")  # a brings its own app back
+    with pytest.raises(TextTimeout):
+        a.tap_text("OK")  # let through: the fake screen just has no text
+
+
+def test_an_agents_end_of_turn_hook_gives_its_phone_up(srv):
+    hook = (f"from http_client import Phone; print('hook', Phone(port={srv.port})._admin('POST', 'done'))")
+    agent = _script(srv, f"""
+        import subprocess, sys
+        p = Phone(port={srv.port})
+        p.read_text(); p.tap(1, 1)
+        r = subprocess.run([sys.executable, "-c", {hook!r}], capture_output=True, text=True)
+        print(r.stdout.strip(), r.stderr.strip()[-300:], flush=True)
+        time.sleep(3)  # the agent goes on running: only the hook frees the phone
+    """)
+    line = agent.stdout.readline()
+    assert "{'released': True}" in line, line
+    b = _phone(srv, "agent-r")
+    t0 = time.monotonic()
+    b.read_text()
+    assert time.monotonic() - t0 < IDLE_S / 2
+    agent.wait(10)
+
+
+def test_a_named_client_frees_the_phone_as_soon_as_it_exits(srv):
+    a = _script(srv, f"""
+        p = Phone(name="named-script", port={srv.port})
+        p.read_text(); p.tap(1, 1)
+    """)
+    a.communicate(timeout=20)
+    b = _phone(srv, "agent-s")
+    t0 = time.monotonic()
+    b.read_text()
+    assert time.monotonic() - t0 < IDLE_S / 2

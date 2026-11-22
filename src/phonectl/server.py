@@ -117,11 +117,13 @@ def _request_id(ctx: Context) -> str:
         return ""
 
 
-async def _client(ctx: Context) -> Client:
+async def _client(ctx: Context) -> tuple[Client, Optional[int]]:
+    """The client of a call, and the process that made it."""
     req = _request(ctx)
     client = getattr(req, "client", None)
     name = req.headers.get("x-phonectl-client") if req is not None else None
-    return (await identify(arbiter, (client.host, client.port) if client else None, name))[0]
+    found, _, pid = await identify(arbiter, (client.host, client.port) if client else None, name)
+    return found, pid
 
 
 def _tool(kind: str):
@@ -139,7 +141,7 @@ def _tool(kind: str):
         @functools.wraps(fn)
         async def run(*args, ctx: Context, **kwargs):
             try:
-                client = await _client(ctx)
+                client, pid = await _client(ctx)
                 _caller.set(client)
                 if kind == FREE:
                     return await fn(*args, **kwargs)
@@ -147,13 +149,18 @@ def _tool(kind: str):
                 key = (client.key, _request_id(ctx))
                 gave_up = asyncio.Event()
                 _waiting.setdefault(key, []).append(gave_up)
+                asked = time.monotonic()
                 try:
-                    async with arbiter.use(client, gave_up) as lease:
+                    async with arbiter.use(client, gave_up, pid=pid, changes_screen=kind not in (LOOK, CLIP)) as lease:
                         _unlist(key, gave_up)  # it has the phone: a cancel now ends nothing
+                        got = time.monotonic()
                         call = sig.bind(*args, **kwargs)
                         call.apply_defaults()
                         shot = call.arguments.get("screenshot", False)
-                        if kind == BLIND and lease.stale_by:
+                        # Coordinates read before someone else changed the screen may point at
+                        # anything now; so may text, unless the caller has opened its own app
+                        # again since (then the text it finds is in its app).
+                        if lease.stale_by and (kind == BLIND or (kind == AIMED and not lease.relaunched)):
                             if arbiter.sharing:
                                 log.info("%s: %s NOT DONE (%s used the phone since its last look)",
                                          client.label, fn.__name__, lease.stale_by)
@@ -163,6 +170,10 @@ def _tool(kind: str):
                         result = await fn(*args, **kwargs)
                         if kind in (LOOK, AIMED) or (kind == NAV and shot):
                             arbiter.saw_screen(lease)
+                        elif fn.__name__ == "launch_app":
+                            arbiter.relaunched(lease)
+                        log.info("%s: %s done (waited %.1f s, ran %.1f s)", client.label, fn.__name__,
+                                 got - asked, time.monotonic() - got)
                         return result
                 finally:
                     _unlist(key, gave_up)
@@ -484,6 +495,7 @@ async def _admin(scope, receive, send) -> None:
       GET  /phonectl/use                   who is using the phone
       POST /phonectl/release               give the phone up now (scripts, when done)
       POST /phonectl/yield                 between two units of work: give it up if someone waits
+      POST /phonectl/done                  an agent's turn ended (its hook): give it up now
       POST /phonectl/hold {"seconds": n}   keep every client off it while the person uses it
     """
     body = b""
@@ -494,7 +506,7 @@ async def _admin(scope, receive, send) -> None:
             break
     headers = dict(scope["headers"])
     name = headers.get(b"x-phonectl-client", b"").decode() or None
-    client, own = await identify(arbiter, scope.get("client"), name)
+    client, own, _ = await identify(arbiter, scope.get("client"), name)
     route = (scope["method"], scope["path"][len(_ADMIN):])
     status, out = 200, {}
     try:
@@ -504,6 +516,10 @@ async def _admin(scope, receive, send) -> None:
             # A script started by the client that holds the phone is that client's own action,
             # so it ending is not the client being done with the phone.
             out = {"released": own and await arbiter.release(client)}
+        elif route == ("POST", "done"):
+            # Sent by an agent's end-of-turn hook, a process the agent started: unlike release,
+            # it gives up the phone of the agent that started it.
+            out = {"released": await arbiter.release(client)}
         elif route == ("POST", "yield"):
             # Unlike release, a script started by the client may yield for it: the script is the
             # one using the phone, between two of its units of work.
@@ -607,7 +623,7 @@ async def _cancel_waiting(scope, body: bytes) -> bool:
     rid = (msg.get("params") or {}).get("requestId")
     headers = dict(scope["headers"])
     name = headers.get(b"x-phonectl-client", b"").decode() or None
-    client, _ = await identify(arbiter, scope.get("client"), name)
+    client, _, _ = await identify(arbiter, scope.get("client"), name)
     for flag in list(_waiting.get((client.key, str(rid)), [])):
         log.info("%s cancelled a call waiting in line", client.label)
         await arbiter.abandon(flag)

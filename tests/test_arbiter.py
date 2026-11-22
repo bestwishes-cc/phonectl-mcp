@@ -84,7 +84,7 @@ def test_calling_again_keeps_the_place_in_line():
 
 def test_a_client_between_calls_holds_up_no_one():
     async def main():
-        arb = Arbiter(idle_s=10, wait_s=0.2, keep_place_s=5)
+        arb = Arbiter(idle_s=10, wait_s=0.2, keep_place_s=5, retry_hold_s=0.01)
         a, b, c = (arb.client(k, k.upper()) for k in "abc")
         await call(arb, a)
         with pytest.raises(StillWaiting):
@@ -377,7 +377,7 @@ def test_two_calls_of_one_client_wait_side_by_side():
 
 def test_one_call_running_out_of_waiting_keeps_the_clients_other_call_in_line():
     async def main():
-        arb = Arbiter(idle_s=10, wait_s=5, keep_place_s=5)
+        arb = Arbiter(idle_s=10, wait_s=5, keep_place_s=5, retry_hold_s=0.01)
         a, b, c = (arb.client(k, k.upper()) for k in "abc")
         log = []
         await call(arb, a)
@@ -437,3 +437,99 @@ def test_a_call_cancelled_before_it_reached_the_phone_is_not_sent():
                 pass
 
     run(main())
+
+
+def test_a_client_calling_again_is_not_overtaken_in_the_gap():
+    # Its call ran out of waiting and its agent is calling again: someone behind it must not
+    # take the phone in those seconds.
+    async def main():
+        arb = Arbiter(idle_s=10, wait_s=0.2, keep_place_s=5, retry_hold_s=0.5)
+        a, b, c = (arb.client(k, k.upper()) for k in "abc")
+        log = []
+        await call(arb, a)
+        with pytest.raises(StillWaiting):
+            await call(arb, b)
+        arb.wait_s = 5
+        tc = asyncio.create_task(call(arb, c, 0, log))
+        await asyncio.sleep(0.02)
+        assert await arb.yield_to_waiter(a)  # b counts as waiting while it calls again
+        await asyncio.sleep(0.1)
+        tb = asyncio.create_task(call(arb, b, 0, log))
+        arb.idle_s = 0.05
+        await asyncio.gather(tb, tc)
+        return [k for k, _ in log]
+
+    assert run(main()) == ["b", "c"]
+
+
+def test_the_grace_is_three_times_the_longest_pause():
+    async def main():
+        arb = Arbiter(idle_s=10, wait_s=5, grace_min_s=0.01, grace_start_s=5)
+        a = arb.client("a", "A")
+        await call(arb, a)
+        assert arb.grace() == 5  # no pause yet
+        for pause in (0.05, 0.15, 0.05):
+            await asyncio.sleep(pause)
+            await call(arb, a)
+        return arb.grace()
+
+    assert 0.44 < run(main()) < 0.6  # 3 x 0.15, not shrunk by the quick ones
+
+
+def test_a_holder_that_only_looked_does_not_keep_the_phone():
+    async def main():
+        arb = Arbiter(idle_s=10, wait_s=5)
+        a, b = arb.client("a", "A"), arb.client("b", "B")
+        async with arb.use(a, changes_screen=False):
+            pass
+        assert arb.describe() == "free"
+        t0 = time.monotonic()
+        await call(arb, b)
+        return time.monotonic() - t0
+
+    assert run(main()) < 0.1
+
+
+def test_looking_does_not_make_anyone_look_again():
+    async def main():
+        arb = Arbiter(idle_s=0.01, wait_s=5)
+        a, b = arb.client("a", "A"), arb.client("b", "B")
+        arb.saw_screen(await call(arb, a))
+        async with arb.use(b, changes_screen=False):
+            pass
+        return (await call(arb, a)).stale_by
+
+    assert run(main()) is None
+
+
+def test_what_was_seen_is_kept_per_process():
+    # An agent and a script it ran are one client, but the script's look does not show the
+    # agent the screen, and the script's taps change what the agent saw.
+    async def main():
+        arb = Arbiter(idle_s=10, wait_s=5)
+        agent = arb.client("pid:1", "agent", 1)
+        async with arb.use(agent, pid=1) as lease:
+            arb.saw_screen(lease)
+        async with arb.use(agent, pid=2):  # the script taps
+            pass
+        async with arb.use(agent, pid=2, changes_screen=False) as lease:
+            arb.saw_screen(lease)  # and looks
+        async with arb.use(agent, pid=1) as lease:
+            return lease.stale_by
+
+    assert "another process of yours" in run(main())
+
+
+def test_opening_its_own_app_again_is_remembered_until_it_looks():
+    async def main():
+        arb = Arbiter(idle_s=0.01, wait_s=5)
+        a, b = arb.client("a", "A"), arb.client("b", "B")
+        arb.saw_screen(await call(arb, a))
+        await call(arb, b)  # b changes the screen
+        lease = await call(arb, a)  # a opens its app
+        arb.relaunched(lease)
+        after_launch = await call(arb, a)
+        arb.saw_screen(after_launch)
+        return after_launch.stale_by, after_launch.relaunched, (await call(arb, a)).relaunched
+
+    assert run(main()) == ("B", True, False)
