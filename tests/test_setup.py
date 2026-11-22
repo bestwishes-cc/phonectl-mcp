@@ -307,3 +307,16 @@ def test_codex_gets_the_same_stop_hook_in_its_own_file(home, monkeypatch):
     assert len(ours) == 1 and theirs in data["hooks"]["Stop"]
     st._codex_unhook([])
     assert json.loads(hooks.read_text()) == {"hooks": {"Stop": [theirs]}}
+
+
+def test_a_hooks_file_phonectl_made_is_not_backed_up_and_goes_away_again(home, monkeypatch):
+    from pathlib import Path
+
+    hooks = home / "codex" / "hooks.json"
+    monkeypatch.setattr(st, "CODEX_HOOKS", hooks)
+    cmd = st._hook_command(URL, Path("/tok"))
+    st._codex_hook(cmd, [])
+    st._codex_hook(cmd, [])  # phonectl update
+    assert not (hooks.parent / "hooks.json.phonectl.bak").exists()
+    st._codex_unhook([])
+    assert not hooks.exists()

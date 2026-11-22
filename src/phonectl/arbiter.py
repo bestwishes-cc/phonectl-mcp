@@ -231,7 +231,7 @@ class Arbiter:
             c.pid = pid  # a named client's latest process
         return c
 
-    # --- pace ---------------------------------------------------------------------------
+    # --- when a holder counts as done ----------------------------------------------------
 
     def grace(self) -> float:
         """How long a holder may make no call before it counts as done while someone waits.
@@ -439,7 +439,7 @@ class Arbiter:
     async def done(self, client: Client) -> bool:
         """The client's turn ended (its end-of-turn hook): give the phone up, unless another
         process of it that has used the phone is still running (a script it left working in
-        the background). Then the phone goes by the client's pace as usual."""
+        the background). Then the idle time decides, as for any holder."""
         for key, pid in self._views:
             if key == client.key and pid and pid != client.pid and _alive(pid):
                 return False

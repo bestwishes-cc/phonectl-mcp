@@ -594,3 +594,22 @@ def test_a_holder_keeps_the_phone_through_long_pauses_until_its_idle_time():
 
     assert 0.5 < run(main()) < 1.0  # b gets it only after a full idle time
 
+
+def test_a_pause_longer_than_the_steps_before_it_does_not_end_the_holders_task():
+    # The rule this replaced judged a holder by its own pace: after quick steps, a 30 s thought
+    # counted as done. Now only the idle time (90 s) does.
+    now = [0.0]
+    arb = Arbiter(clock=lambda: now[0])
+    a, b = arb.client("a", "A"), arb.client("b", "B")
+
+    async def calls():
+        for _ in range(5):
+            await call(arb, a)
+            now[0] += 1.0
+    run(calls())
+    now[0] += 30.0
+    after_a_thought = arb._may_take(b, True)
+    now[0] += 61.0
+    return_after_idle = arb._may_take(b, True)
+    assert (after_a_thought, return_after_idle) == (False, True)
+

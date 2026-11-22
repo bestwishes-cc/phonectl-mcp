@@ -48,11 +48,27 @@ BACKUP = ".phonectl.bak"  # its own suffix: a <file>.bak the user or another too
 
 def _backup(path: Path, changed: list[str]) -> None:
     """Keep the file as it was before phonectl first changed it, as <file>.phonectl.bak. A later
-    run does not overwrite that copy: it would replace the user's original with phonectl's edit."""
+    run does not overwrite that copy: it would replace the user's original with phonectl's edit.
+    A file phonectl itself creates has no original: it is recorded instead (see _created), so a
+    later run neither backs up phonectl's own content as "the original" nor leaves it behind."""
     bak = path.with_name(path.name + BACKUP)
-    if path.exists() and not bak.exists():
+    if not path.exists():
+        _set_created(path, True)
+    elif not bak.exists() and str(path) not in _created():
         shutil.copy2(path, bak)
     changed.append(str(path))
+
+
+def _created() -> list[str]:
+    return list(_state().get("_files", {}).get("created", []))
+
+
+def _set_created(path: Path, created: bool) -> None:
+    state = _state()
+    files = state.setdefault("_files", {})
+    paths = [p for p in files.get("created", []) if p != str(path)]
+    files["created"] = paths + [str(path)] if created else paths
+    _save_state(state)
 
 
 # --- the agents -----------------------------------------------------------------------------
@@ -330,7 +346,7 @@ def _dsh_remove(changed: list[str]) -> None:
 # --- end-of-turn hooks ------------------------------------------------------------------
 #
 # When an agent's turn ends, it is done with the phone; without a hook the server only finds
-# that out once the agent has paused for longer than its pace (see arbiter.grace). The hook
+# that out once the agent has made no call for PHONECTL_IDLE (90 s) while someone waits. The hook
 # runs a command that tells the server so (POST /phonectl/done), reading the token from its
 # file so that no settings file holds it.
 
@@ -362,6 +378,12 @@ def _load_json(path: Path) -> dict:
 
 
 def _write_json(path: Path, data: dict, changed: list[str]) -> None:
+    if not data and str(path) in _created():
+        # Nothing left in a file phonectl made: take the file away again.
+        path.unlink(missing_ok=True)
+        _set_created(path, False)
+        changed.append(str(path))
+        return
     _backup(path, changed)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
@@ -532,8 +554,11 @@ def _put_skill(agent: Agent, record: dict, force: bool) -> str:
 
 
 def _changed_lines(changed: list[str]) -> list[str]:
+    made = _created()
     return [f"  changed {c} (original kept as {c}{BACKUP})" if Path(c + BACKUP).exists()
-            else f"  created {c}" for c in sorted(set(changed))]
+            else f"  wrote {c} (made by phonectl)" if c in made
+            else f"  removed {c} (made by phonectl)" if not Path(c).exists()
+            else f"  changed {c}" for c in sorted(set(changed))]
 
 
 def install(name: str, url: str, token: str, force: bool = False,
@@ -549,10 +574,11 @@ def install(name: str, url: str, token: str, force: bool = False,
         agent.add_hook(_hook_command(url, token_path), changed)
         hook = "end-of-turn hook set"
     else:
-        hook = "no end-of-turn hook (the server goes by its pace)"
+        hook = "no end-of-turn hook (the server frees the phone 90 s after its last call if someone waits)"
     skill = _put_skill(agent, record, force)
     if "left as it is" not in skill:
         record = {"version": __version__, "skill_hash": _tree_hash(agent.skills / SKILL)}
+    state = _state()  # again: writing files may have recorded some meanwhile
     state[name] = {**record, "mcp_url": url}
     _save_state(state)
     return [f"{agent.title}: MCP server '{NAME}' -> {url}; {skill}; {hook}",
@@ -576,6 +602,8 @@ def uninstall(name: str) -> list[str]:
         skill = f"skill left in {dest}: it was changed by hand"
     else:
         skill = "no skill to remove"
+    state = _state()
+    state.pop(name, None)
     _save_state(state)
     return [f"{agent.title}: MCP server '{NAME}' removed; {skill}",
             *_changed_lines(changed),
