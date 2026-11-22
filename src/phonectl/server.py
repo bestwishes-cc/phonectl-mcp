@@ -37,7 +37,7 @@ from PIL import Image as PILImage
 from pymobiledevice3.exceptions import CoreDeviceError
 
 from . import __version__, logtrim
-from .arbiter import Arbiter, Busy, Client, Lease, identify
+from .arbiter import Abandoned, Arbiter, Client, Lease, StillWaiting, identify
 from .device import NORM_MAX, Device, InputUncertain
 from .keys import parse_key
 from .ocr import recognize
@@ -70,13 +70,17 @@ _screen_pt: Optional[tuple[float, float]] = None
 # Held from putting text on the clipboard until it is pasted, so another client's clipboard
 # write cannot land in between and get pasted instead.
 _clipboard_lock = asyncio.Lock()
-arbiter = Arbiter()
+# PHONECTL_SHARING=off is for benchmarks only: it measures what sharing prevents (see Arbiter).
+arbiter = Arbiter(sharing=os.environ.get("PHONECTL_SHARING", "on") != "off")
+# Calls waiting in line, by (client key, request id), so a client that hangs up on one by
+# notifications/cancelled can end the wait (see _cancel_waiting).
+_waiting: dict[tuple[str, str], asyncio.Event] = {}
 # The client of the tool call being served (for status).
 _caller: ContextVar[Client] = ContextVar("phonectl_caller")
 
 
 # Failures whose message says everything; anything else is a bug here and is logged in full.
-_EXPECTED = (ValueError, ConnectionError, OSError, InputUncertain, CoreDeviceError, Busy)
+_EXPECTED = (ValueError, ConnectionError, OSError, InputUncertain, CoreDeviceError, Abandoned)
 
 
 # How a tool uses the phone, which decides how it is shared (see arbiter):
@@ -94,6 +98,13 @@ def _request(ctx: Context):
         return ctx.request_context.request
     except ValueError:  # "Context is not available outside of a request"
         return None
+
+
+def _request_id(ctx: Context) -> str:
+    try:
+        return str(ctx.request_id)
+    except ValueError:  # called directly (tests): no request to cancel
+        return ""
 
 
 async def _client(ctx: Context) -> Client:
@@ -123,16 +134,29 @@ def _tool(kind: str):
                 if kind == FREE:
                     return await fn(*args, **kwargs)
                 log.info("%s: %s", client.label, fn.__name__)
-                async with arbiter.use(client) as lease:
-                    call = sig.bind(*args, **kwargs)
-                    call.apply_defaults()
-                    shot = call.arguments.get("screenshot", False)
-                    if kind == BLIND and lease.stale_by:
-                        return _not_done(lease)
-                    result = await fn(*args, **kwargs)
-                    if kind in (LOOK, AIMED) or (kind == NAV and shot):
-                        arbiter.saw_screen(lease)
-                    return result
+                key = (client.key, _request_id(ctx))
+                gave_up = _waiting[key] = asyncio.Event()
+                try:
+                    async with arbiter.use(client, gave_up) as lease:
+                        _waiting.pop(key, None)  # it has the phone: a cancel now ends nothing
+                        call = sig.bind(*args, **kwargs)
+                        call.apply_defaults()
+                        shot = call.arguments.get("screenshot", False)
+                        if kind == BLIND and lease.stale_by:
+                            if arbiter.sharing:
+                                return _not_done(lease)
+                            log.warning("crossed input: %s: %s after %s used the phone since its last look",
+                                        client.label, fn.__name__, lease.stale_by)
+                        result = await fn(*args, **kwargs)
+                        if kind in (LOOK, AIMED) or (kind == NAV and shot):
+                            arbiter.saw_screen(lease)
+                        return result
+                finally:
+                    if _waiting.get(key) is gave_up:
+                        del _waiting[key]
+            except StillWaiting as w:
+                log.info("%s: %s still waiting (number %d in line)", client.label, fn.__name__, w.position)
+                return _still_waiting(fn.__name__, w)
             except ToolError:
                 raise
             except Exception as e:
@@ -159,6 +183,18 @@ def _not_done(lease: Lease) -> CallToolResult:
     note = (f"NOT DONE: {lease.stale_by} used the phone after you last looked at the screen, so it may show "
             "something else now; nothing was sent. Look at the screen (screenshot or read_text) and "
             "repeat the call if it still applies.")
+    return CallToolResult(content=[TextContent(type="text", text=note)], is_error=True)
+
+
+def _still_waiting(tool: str, w: StillWaiting) -> CallToolResult:
+    """The answer to a call that waited in line for as long as a call may wait.
+
+    Worded so that an agent calls again instead of giving up on its task (with "try again
+    later", agents tested stopped; with this, they called again and finished). An error result,
+    so that a script cannot take it for the input having been sent."""
+    note = (f"WAITING, nothing was done: {w.detail}. This is normal and not a failure of your task: "
+            f"call {tool} again now with the same arguments. You are number {w.position} in line and "
+            f"keep your place for {w.keep_s:.0f} s.")
     return CallToolResult(content=[TextContent(type="text", text=note)], is_error=True)
 
 
@@ -395,8 +431,8 @@ async def set_clipboard(text: str) -> str:
 @_tool(FREE)
 async def status() -> str:
     """Report the server, the link to the phone and who is using it. Clients share the phone:
-    while one uses it, another's calls wait (then fail with Busy), so check here first to skip
-    work rather than wait."""
+    while one uses it, another's calls wait in line (answered WAITING if it takes long), so
+    check here first to skip work rather than wait."""
     lines = [f"server: phonectl-mcp {__version__}, pid {os.getpid()}, up since {_STARTED}, code from {_CODE_STAMP}",
              f"use: {arbiter.describe(_caller.get(None))}"]
     try:
@@ -435,6 +471,7 @@ async def _admin(scope, receive, send) -> None:
     not carry it in their context:
       GET  /phonectl/use                   who is using the phone
       POST /phonectl/release               give the phone up now (scripts, when done)
+      POST /phonectl/yield                 between two units of work: give it up if someone waits
       POST /phonectl/hold {"seconds": n}   keep every client off it while the person uses it
     """
     body = b""
@@ -455,6 +492,10 @@ async def _admin(scope, receive, send) -> None:
             # A script started by the client that holds the phone is that client's own action,
             # so it ending is not the client being done with the phone.
             out = {"released": own and await arbiter.release(client)}
+        elif route == ("POST", "yield"):
+            # Unlike release, a script started by the client may yield for it: the script is the
+            # one using the phone, between two of its units of work.
+            out = {"yielded": await arbiter.yield_to_waiter(client)}
         elif route == ("POST", "hold"):
             await arbiter.hold_for_person(float(json.loads(body or b"{}").get("seconds", 0)))
             out = {"use": arbiter.describe(client)}
@@ -500,7 +541,65 @@ class _BearerAuth:
                         "headers": [(b"allow", b"POST, DELETE"), (b"content-type", b"text/plain")]})
             await send({"type": "http.response.body", "body": b"no server-to-client stream\n"})
             return
+        if scope["type"] == "http" and scope["method"] == "POST":
+            body, receive = await _read_body(receive)
+            if await _cancel_waiting(scope, body):
+                await send({"type": "http.response.start", "status": 202, "headers": []})
+                await send({"type": "http.response.body", "body": b""})
+                return
         await self.app(scope, receive, send)
+
+
+async def _read_body(receive):
+    """The whole request body, and a receive that hands it to the app again, then goes on."""
+    chunks = []
+    while True:
+        msg = await receive()
+        if msg["type"] != "http.request":  # the client went away before the body was complete
+            async def gone():
+                return msg
+            return b"", gone
+        chunks.append(msg.get("body", b""))
+        if not msg.get("more_body"):
+            break
+    body, replayed = b"".join(chunks), False
+
+    async def again():
+        nonlocal replayed
+        if not replayed:
+            replayed = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return await receive()
+    return body, again
+
+
+async def _cancel_waiting(scope, body: bytes) -> bool:
+    """End the wait of a call whose client cancelled it, so the input is never sent later.
+
+    Clients on the 2025 wire cancel by posting notifications/cancelled; a stateless server
+    drops it (no session to find the request in), and the call would go on waiting and then
+    act on the phone after its client stopped waiting for it. The cancel is matched to the
+    same client's waiting call by request id (request ids of two MCP sessions in one process
+    can clash; the worst case is ending the wrong one of that process's waits, never an input).
+    2026-wire clients cancel by closing the response stream, which the SDK handles itself.
+    True if body was such a notice (handled here; the SDK would only drop it)."""
+    if b"notifications/cancelled" not in body:
+        return False
+    try:
+        msg = json.loads(body)
+    except ValueError:
+        return False
+    if not isinstance(msg, dict) or msg.get("method") != "notifications/cancelled" or "id" in msg:
+        return False
+    rid = (msg.get("params") or {}).get("requestId")
+    headers = dict(scope["headers"])
+    name = headers.get(b"x-phonectl-client", b"").decode() or None
+    client, _ = await identify(arbiter, scope.get("client"), name)
+    flag = _waiting.get((client.key, str(rid)))
+    if flag is not None:
+        log.info("%s cancelled a call waiting in line", client.label)
+        await arbiter.abandon(flag)
+    return True
 
 
 def _serve_http() -> None:

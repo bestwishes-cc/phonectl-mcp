@@ -7,7 +7,7 @@ script in another process would, with only the standard library.
         phone.read_text()
         phone.tap(10, 10)
 
-Refusals become exceptions: Busy, ScreenChanged (NOT DONE), TextTimeout, PhoneError.
+Refusals become exceptions: Waiting, ScreenChanged (NOT DONE), TextTimeout, PhoneError.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ DEFAULT_PORT = 47321
 # Below the server's keep-alive timeout (uvicorn's 5 s).
 _KEEPALIVE_S = 4.0
 _SDK_PREFIX = re.compile(r"^Error executing tool \w+: ")
-# Longer than the server's wait for the phone (PHONECTL_WAIT, 180 s) plus the slowest call.
+# Longer than the server's wait for the phone (PHONECTL_WAIT, 50 s) plus the slowest call.
 TIMEOUT_S = 600.0
 
 
@@ -33,8 +33,9 @@ class PhoneError(RuntimeError):
     """A tool call failed; the message is the server's."""
 
 
-class Busy(PhoneError):
-    """Another client kept the phone for the whole wait."""
+class Waiting(PhoneError):
+    """Another client kept the phone for the whole wait; nothing was done. Calling again keeps
+    this client's place in line."""
 
 
 class ScreenChanged(PhoneError):
@@ -112,10 +113,16 @@ class Phone:
         text = "".join(c.get("text", "") for c in content if c.get("type") == "text")
         if result.get("isError"):
             cause = _SDK_PREFIX.sub("", text)  # the error's own "Type: message"
-            kind = (Busy if cause.startswith("Busy:") else TextTimeout if cause.startswith("TimeoutError:")
+            kind = (Waiting if cause.startswith("WAITING") else TextTimeout if cause.startswith("TimeoutError:")
                     else ScreenChanged if cause.startswith("NOT DONE:") else PhoneError)
             raise kind(cause)
         return content
+
+    def cancel(self, request_id: int) -> int:
+        """Post notifications/cancelled for a request, as clients on the 2025 wire do; the HTTP status."""
+        body = json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                           "params": {"requestId": request_id, "reason": "timed out"}}).encode()
+        return self._request("POST", "/mcp", body)[0]
 
     def _text(self, tool: str, **arguments: Any) -> str:
         return "".join(c.get("text", "") for c in self.call(tool, **arguments) if c.get("type") == "text")

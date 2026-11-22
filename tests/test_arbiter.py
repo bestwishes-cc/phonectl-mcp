@@ -4,7 +4,7 @@ import time
 import pytest
 
 from phonectl import arbiter as arbiter_module
-from phonectl.arbiter import Arbiter, Busy
+from phonectl.arbiter import Abandoned, Arbiter, StillWaiting
 
 
 def run(coro):
@@ -48,20 +48,156 @@ def test_a_call_in_progress_is_never_cut_off():
     assert (ka, kb) == ("a", "b") and tb - ta >= 0.4
 
 
-def test_busy_after_the_wait():
+def test_a_call_that_ran_out_of_waiting_did_nothing_and_is_told_who_has_the_phone():
     async def main():
         arb = Arbiter(idle_s=10, wait_s=0.3)
         a, b = arb.client("a", "A"), arb.client("b", "B")
         await call(arb, a)
-        with pytest.raises(Busy, match=r"in use by A"):
+        with pytest.raises(StillWaiting, match=r"A is using the phone") as w:
             await call(arb, b)
-        # The one that gave up is out of the line: the holder goes on, and so does a third
-        # client once the holder releases.
+        assert w.value.position == 1
+        # The holder goes on meanwhile, and gives the phone up as before.
         await call(arb, a)
         assert await arb.release(a)
-        await call(arb, arb.client("c", "C"))
 
     run(main())
+
+
+def test_calling_again_keeps_the_place_in_line():
+    async def main():
+        arb = Arbiter(idle_s=0.1, wait_s=0.2, keep_place_s=5)
+        a, b, c = (arb.client(k, k.upper()) for k in "abc")
+        log = []
+        ta = asyncio.create_task(call(arb, a, 0.6))  # a long call: nobody gets in before it ends
+        await asyncio.sleep(0.02)
+        with pytest.raises(StillWaiting):
+            await call(arb, b)  # b's agent takes a model step before calling again
+        arb.wait_s = 5
+        tc = asyncio.create_task(call(arb, c, 0, log))
+        await asyncio.sleep(0.05)
+        tb = asyncio.create_task(call(arb, b, 0, log))  # b is back: ahead of c, who came later
+        await asyncio.gather(ta, tb, tc)
+        return [k for k, _ in log]
+
+    assert run(main()) == ["b", "c"]
+
+
+def test_a_client_between_calls_holds_up_no_one():
+    async def main():
+        arb = Arbiter(idle_s=10, wait_s=0.2, keep_place_s=5)
+        a, b, c = (arb.client(k, k.upper()) for k in "abc")
+        await call(arb, a)
+        with pytest.raises(StillWaiting):
+            await call(arb, b)
+        tc = asyncio.create_task(call(arb, c))
+        await asyncio.sleep(0.05)
+        assert "B (between calls)" in arb.describe()
+        assert await arb.release(a)
+        await asyncio.wait_for(tc, 0.1)  # c goes now; the phone does not sit idle waiting for b
+
+    run(main())
+
+
+def test_a_kept_place_runs_out():
+    async def main():
+        arb = Arbiter(idle_s=10, wait_s=0.1, keep_place_s=0.2)
+        a, b = arb.client("a", "A"), arb.client("b", "B")
+        await call(arb, a)
+        with pytest.raises(StillWaiting):
+            await call(arb, b)
+        assert "waiting: B" in arb.describe()
+        await asyncio.sleep(0.25)
+        return arb.describe()
+
+    assert "waiting" not in run(main())
+
+
+def test_an_abandoned_wait_ends_without_the_phone_and_leaves_the_line():
+    async def main():
+        arb = Arbiter(idle_s=10, wait_s=5)
+        a, b = arb.client("a", "A"), arb.client("b", "B")
+        await call(arb, a)
+        gave_up = asyncio.Event()
+
+        async def b_call():
+            async with arb.use(b, gave_up):
+                return "got the phone"
+
+        waiting = asyncio.create_task(b_call())
+        await asyncio.sleep(0.05)
+        await arb.abandon(gave_up)
+        with pytest.raises(Abandoned):
+            await waiting
+        return arb.describe()
+
+    assert "waiting" not in run(main())
+
+
+def test_the_holder_is_judged_by_its_own_pace():
+    # A quick holder that has stopped is done long before the slowest pace's grace runs out.
+    async def main():
+        arb = Arbiter(idle_s=10, wait_s=10, grace_min_s=0.05, grace_start_s=10)
+        a, b = arb.client("a", "A"), arb.client("b", "B")
+        for _ in range(5):
+            await call(arb, a)
+            await asyncio.sleep(0.03)
+        assert arb.grace() < 0.5
+        t0 = time.monotonic()
+        await call(arb, b)
+        return time.monotonic() - t0
+
+    assert run(main()) < 1.0
+
+
+def test_a_new_holder_starts_from_the_default_grace():
+    async def main():
+        arb = Arbiter(idle_s=10, wait_s=10, grace_min_s=0.05, grace_start_s=3)
+        a, b = arb.client("a", "A"), arb.client("b", "B")
+        for _ in range(4):
+            await call(arb, a)
+            await asyncio.sleep(0.02)
+        assert await arb.release(a)
+        await call(arb, b)  # b's pace is not a's
+        return arb.grace()
+
+    assert run(main()) == 3
+
+
+def test_yield_gives_the_phone_up_only_to_someone_waiting():
+    async def main():
+        arb = Arbiter(idle_s=0.3, wait_s=5)
+        a, b = arb.client("a", "A"), arb.client("b", "B")
+        log = []
+        await call(arb, a)
+        assert not await arb.yield_to_waiter(a)  # nobody waits: a keeps it
+        await call(arb, a, 0, log)
+        tb = asyncio.create_task(call(arb, b, 0, log))
+        await asyncio.sleep(0.05)
+        t0 = time.monotonic()
+        assert await arb.yield_to_waiter(a)
+        await tb
+        waited = time.monotonic() - t0
+        await call(arb, a, 0, log)  # a's next unit waits its turn
+        return [k for k, _ in log], waited
+
+    order, waited = run(main())
+    assert order == ["a", "b", "a"] and waited < 0.2
+
+
+def test_without_sharing_every_call_goes_at_once_and_crossings_show():
+    async def main():
+        arb = Arbiter(idle_s=10, wait_s=5, sharing=False)
+        a, b = arb.client("a", "A"), arb.client("b", "B")
+        log = []
+        arb.saw_screen(await call(arb, b))
+        ta = asyncio.create_task(call(arb, a, 0.3, log))
+        await asyncio.sleep(0.05)
+        lease = await call(arb, b, 0, log)  # does not wait for a's call
+        await ta
+        return [k for k, _ in log], lease.stale_by
+
+    order, stale = run(main())
+    assert order == ["a", "b"] and stale == "A"
 
 
 def test_waiters_are_served_in_order():

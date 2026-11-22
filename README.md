@@ -103,10 +103,11 @@ Tools that act on the phone return a screenshot taken afterwards (`screenshot=Fa
 
 ## Several agents, one phone
 
-All clients of the server share the phone, and they take turns: a client that starts using it keeps it until it has made no call for 90 s. A call from another client meanwhile waits (up to 180 s, then it fails with `Busy`) instead of landing on the other agent's screen. The waiting agent then carries on by itself, and waiting costs it no tokens. `status` says who has the phone.
+All clients of the server share the phone, and they take turns: a client that starts using it keeps it until it pauses for longer than its own recent pace (10 to 90 s). A call from another client meanwhile waits in line instead of landing on the other agent's screen. A wait lasts at most 50 s, shorter than any agent's own tool timeout; then the call ends with `WAITING`, having done nothing, and the client keeps its place in line for 2 minutes: calling again carries on from there. Agents read `WAITING` as a reason to call again, not as a failure. `status` says who has the phone and who waits.
 
 - Clients are told apart by their process: a Claude Code session and its subagents are one client. A script that an agent runs counts as that agent, so it neither waits for the agent nor takes the phone from it; a script started from a terminal is a client of its own. A process that runs several independent tasks sends a header `X-Phonectl-Client: <name>` per task. When a client's process exits, the phone is free at once.
 - A tap, swipe, typing or key press is sent only if the client has looked at the screen since anyone else used the phone. Otherwise the call fails with `NOT DONE` and nothing is sent; look at the screen and repeat it. This also holds for a client's first such input after the server starts, since the server cannot know who used the phone before. `tap_text`, `launch_app` and `press_button` need no old coordinates and are always sent.
+- A long-running script gives the phone up between two units of work with `POST /phonectl/yield` (same token), which hands it over only if someone is waiting. Without that, others wait until it pauses, or for up to 30 minutes.
 - The server cannot see you using the phone by hand: `phonectl hold 30m` keeps agents off it, `phonectl hold off` ends that.
 
 ## Scripts
@@ -132,8 +133,11 @@ async def main():
             for tool, args in [("launch_app", {"bundle_id": "com.apple.Preferences", "restart": True}),
                                ("tap_text", {"text": "Wi-Fi", "timeout_s": 5, "settle_ms": 1000}),
                                ("read_text", {})]:
-                result = await phone.call_tool(tool, {**args, "screenshot": False} if tool != "read_text" else args)
-                if result.is_error:  # Busy, NOT DONE, the phone gone: stop instead of carrying on
+                args = {**args, "screenshot": False} if tool != "read_text" else args
+                result = await phone.call_tool(tool, args)
+                while result.is_error and result.content[0].text.startswith("WAITING"):
+                    result = await phone.call_tool(tool, args)  # another client has the phone: same place in line
+                if result.is_error:  # NOT DONE, the phone gone: stop instead of carrying on
                     return f"{tool}: {result.content[0].text}"
             return [line["t"] for line in json.loads(result.content[0].text)]
 
@@ -177,9 +181,9 @@ Run `phonectl doctor` first. It tells you which link is broken.
 | `PHONECTL_TOUCH_IDLE` | `30` | Idle seconds before the input stream closes (reopening takes ~0.6 s) |
 | `PHONECTL_KEY_IDLE` | `5` | Seconds without a key before the virtual keyboard detaches, so the on-screen keyboard comes back |
 | `PHONECTL_CALL_TIMEOUT` | `15` | Seconds to wait for the phone, on top of the gesture time |
-| `PHONECTL_IDLE` | `90` | Seconds without a call after which a client has finished with the phone |
-| `PHONECTL_WAIT` | `180` | Seconds a call waits for the phone before failing with `Busy`; keep it below the client's own tool timeout |
-| `PHONECTL_MAX_HOLD` | `600` | After holding the phone this long, a client lets a waiting one go first |
+| `PHONECTL_IDLE` | `90` | The longest pause after which a client has finished with the phone; a quick client is judged by its own pace, from 10 s |
+| `PHONECTL_WAIT` | `50` | Seconds a call waits in line before it ends with `WAITING`; keep it below the clients' own tool timeouts |
+| `PHONECTL_MAX_HOLD` | `1800` | After holding the phone this long, a client lets a waiting one go first |
 | `PHONECTL_LOG` | `WARNING` | Log level (`INFO` for the service, which logs each call with its client); logs in `~/Library/Logs/phonectl*.log`; a log over 10 MB moves to `<file>.1`, replacing the older one |
 
 </details>

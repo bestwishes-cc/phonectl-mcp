@@ -14,8 +14,11 @@ def _status(header: bytes | None, method: str = "POST") -> int:
     async def send(msg):
         sent.append(msg)
 
+    async def receive():
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
     headers = [(b"authorization", header)] if header is not None else []
-    asyncio.run(_BearerAuth(_app, "secret")({"type": "http", "method": method, "headers": headers}, None, send))
+    asyncio.run(_BearerAuth(_app, "secret")({"type": "http", "method": method, "headers": headers}, receive, send))
     return sent[0]["status"]
 
 

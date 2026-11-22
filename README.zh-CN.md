@@ -103,10 +103,11 @@ claude mcp add --scope user --transport http phone http://127.0.0.1:47321/mcp \
 
 ## 多个 Agent 共用一台手机
 
-连到服务的客户端共用这台手机，轮流使用：一个客户端开始用手机后，就一直占着，直到它连续 90 秒没有调用。这期间别的客户端的调用会排队等待（最多 180 秒，超时报 `Busy`），不会落到对方的屏幕上。等到手机空出来，等待的 Agent 会自己接着做，等待期间不消耗 token。`status` 会显示谁在用手机。
+连到服务的客户端共用这台手机，轮流使用：一个客户端开始用手机后，就一直占着，直到它停顿的时间超过它自己最近的节奏（10 到 90 秒）。这期间别的客户端的调用会排队等待，不会落到对方的屏幕上。一次调用最多等 50 秒，比各个 Agent 自己的工具超时都短；等不到就返回 `WAITING`，什么都没做，这个客户端的排队位置保留 2 分钟，再调用一次就从原位接着等。Agent 会把 `WAITING` 当作再调用一次的提示，而不是失败。`status` 会显示谁在用手机、谁在排队。
 
 - 服务按进程区分客户端：一个 Claude Code 会话和它的子 Agent 算一个客户端。Agent 运行的脚本算作这个 Agent 本人，不用等它，也不会把手机从它手里拿走；从终端直接运行的脚本是一个单独的客户端。一个进程里跑几个互不相干的任务时，每个任务发送请求头 `X-Phonectl-Client: <名字>`。客户端的进程一退出，手机马上空出来。
 - 只有在别人用过手机之后、这个客户端又看过屏幕，它的点按、滑动、打字、按键才会发出。否则这次调用返回错误 `NOT DONE`，什么都不发；先看一眼屏幕，再决定要不要重做。服务启动后每个客户端的第一次这类操作也是如此，因为服务不知道之前谁用过手机。`tap_text`、`launch_app`、`press_button` 不依赖旧坐标，总是照常执行。
+- 长时间运行的脚本，在两个工作单元之间调用 `POST /phonectl/yield`（同一个令牌）让出手机：只有在有人排队时才交出去。不让出的话，别人要等它停顿，最长等 30 分钟。
 - 服务看不到你本人在用手机：`phonectl hold 30m` 让各个 Agent 让开，`phonectl hold off` 结束。
 
 ## 脚本
@@ -132,8 +133,11 @@ async def main():
             for tool, args in [("launch_app", {"bundle_id": "com.apple.Preferences", "restart": True}),
                                ("tap_text", {"text": "无线局域网", "timeout_s": 5, "settle_ms": 1000}),
                                ("read_text", {})]:
-                result = await phone.call_tool(tool, {**args, "screenshot": False} if tool != "read_text" else args)
-                if result.is_error:  # Busy、NOT DONE、手机断开：停下，不要往下走
+                args = {**args, "screenshot": False} if tool != "read_text" else args
+                result = await phone.call_tool(tool, args)
+                while result.is_error and result.content[0].text.startswith("WAITING"):
+                    result = await phone.call_tool(tool, args)  # another client has the phone: same place in line
+                if result.is_error:  # NOT DONE、手机断开：停下，不要往下走
                     return f"{tool}: {result.content[0].text}"
             return [line["t"] for line in json.loads(result.content[0].text)]
 
@@ -177,9 +181,9 @@ print(asyncio.run(main()))
 | `PHONECTL_TOUCH_IDLE` | `30` | 空闲几秒后关闭输入通道（重开约 0.6 秒） |
 | `PHONECTL_KEY_IDLE` | `5` | 几秒没按键后断开虚拟键盘，屏幕键盘随之回来 |
 | `PHONECTL_CALL_TIMEOUT` | `15` | 等手机响应几秒算失败（不含手势耗时） |
-| `PHONECTL_IDLE` | `90` | 一个客户端连续几秒没有调用，就算用完了手机 |
-| `PHONECTL_WAIT` | `180` | 调用最多等几秒手机，超时报 `Busy`；要短于客户端自己的工具超时 |
-| `PHONECTL_MAX_HOLD` | `600` | 一个客户端连续占用这么久以后，让排队的客户端先用 |
+| `PHONECTL_IDLE` | `90` | 客户端停顿多久一定算用完了手机；节奏快的客户端按它自己的节奏判断，最短 10 秒 |
+| `PHONECTL_WAIT` | `50` | 调用最多排队等几秒，之后返回 `WAITING`；要短于各客户端自己的工具超时 |
+| `PHONECTL_MAX_HOLD` | `1800` | 一个客户端连续占用这么久以后，让排队的客户端先用 |
 | `PHONECTL_LOG` | `WARNING` | 日志级别（服务为 `INFO`，会记下每次调用来自哪个客户端），日志在 `~/Library/Logs/phonectl*.log`；一个日志超过 10 MB 时，旧内容移到 `<文件名>.1`，替换更早的那份 |
 
 </details>

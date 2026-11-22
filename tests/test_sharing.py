@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from http_client import Busy, Phone, ScreenChanged
+from http_client import Phone, PhoneError, ScreenChanged, Waiting
 
 HERE = Path(__file__).parent
 IDLE_S = 1.0
@@ -123,16 +123,58 @@ def test_inputs_that_need_no_old_coordinates_are_sent_after_losing_the_phone(srv
     a.tap(3, 3)
 
 
-def test_busy_when_the_person_holds_the_phone(srv):
+def test_waiting_when_the_person_holds_the_phone(srv):
     a = _phone(srv, "agent-e")
     a._admin("POST", "hold", {"seconds": 30})
     try:
         t0 = time.monotonic()
-        with pytest.raises(Busy, match="person using it"):
+        with pytest.raises(Waiting, match="nothing was done: the person using the phone holds it") as w:
             a.tap(5, 5)
         assert WAIT_S <= time.monotonic() - t0 < WAIT_S + 2
+        assert "call tap again now with the same arguments" in str(w.value)
     finally:
         a._admin("POST", "hold", {"seconds": 0})
+
+
+def test_a_call_its_client_cancelled_while_waiting_is_never_sent(srv):
+    # A client on the 2025 wire that times out posts notifications/cancelled and stops waiting;
+    # the input must not reach the phone when the line moves on later.
+    import threading
+
+    a, a_again = _phone(srv, "agent-m"), _phone(srv, "agent-m")
+    a._admin("POST", "hold", {"seconds": 30})
+    sent = len(srv.inputs.read_text().splitlines())
+    outcome = []
+    t = threading.Thread(target=lambda: outcome.append(_try(a.launch_app, "com.example.ghost")))
+    t.start()
+    time.sleep(0.5)
+    assert a_again.cancel(a._id) == 202  # the id of the call now waiting
+    t.join(10)
+    a._admin("POST", "hold", {"seconds": 0})
+    time.sleep(0.5)
+    assert outcome and isinstance(outcome[0], PhoneError) and "Abandoned" in str(outcome[0]), outcome
+    assert len(srv.inputs.read_text().splitlines()) == sent  # nothing reached the phone
+
+
+def _try(fn, *args):
+    try:
+        return fn(*args)
+    except PhoneError as e:
+        return e
+
+
+def test_a_script_yields_between_units_to_a_waiting_client(srv):
+    a = _phone(srv, "agent-n")
+    a.read_text()
+    assert a._admin("POST", "yield") == {"yielded": False}  # nobody waits
+    b = _script(srv, f"""
+        p = Phone(name="agent-o", port={srv.port}); t = time.monotonic()
+        p.read_text(); print("b waited", round(time.monotonic() - t, 2))
+    """)
+    time.sleep(0.5)
+    assert a._admin("POST", "yield") == {"yielded": True}
+    out, _ = b.communicate(timeout=10)
+    assert float(out.split("b waited ")[1]) < IDLE_S, out
 
 
 def test_release_hands_the_phone_over_at_once(srv):
