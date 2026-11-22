@@ -26,7 +26,7 @@ def test_codex_gets_one_phone_table_and_keeps_the_rest(home):
     conf = tomllib.loads(st.CODEX_TOML.read_text())
     assert conf["mcp_servers"]["phone"] == {"url": URL, "http_headers": {"Authorization": "Bearer tok"}}
     assert conf["mcp_servers"]["other"] == {"command": "y"} and conf["model"] == "x"
-    assert (st.CODEX_TOML.parent / "config.toml.bak").exists()
+    assert (st.CODEX_TOML.parent / "config.toml.phonectl.bak").exists()
     st._codex_remove([])
     assert "phone" not in tomllib.loads(st.CODEX_TOML.read_text())["mcp_servers"]
 
@@ -145,7 +145,7 @@ def test_the_first_backup_is_the_original(home):
     st.DSH_PATCH.write_text(DSH)
     st._dsh_add(URL, TOKEN, [])
     st._dsh_add("http://127.0.0.1:1/other", TOKEN, [])
-    assert (st.DSH_PATCH.parent / "cordis.patch.yml.bak").read_text() == DSH
+    assert (st.DSH_PATCH.parent / "cordis.patch.yml.phonectl.bak").read_text() == DSH
 
 
 def test_codex_keeps_the_comments_above_the_next_table(home):
@@ -161,3 +161,60 @@ def test_a_broken_record_file_is_reported_not_overwritten(home):
     with pytest.raises(st.SetupError):
         st.installed()
     assert st.STATE.read_text() == "{not json"
+
+
+def test_comments_after_the_phone_entry_stay_through_repeated_runs(home):
+    st.DSH_PATCH.parent.mkdir()
+    st.DSH_PATCH.write_text("- id: mcp-manager\n  config:\n    servers:\n      # c3\n      other:\n        url: http://x\n"
+                            "      # old:\n      #   command: bar\n")
+    for _ in range(2):
+        st._dsh_add(URL, TOKEN, [])
+    text = st.DSH_PATCH.read_text()
+    assert "      # c3\n" in text and "      # old:\n      #   command: bar\n" in text
+    st._dsh_remove([])
+    text = st.DSH_PATCH.read_text()
+    assert "phone" not in text and "# c3" in text and "#   command: bar" in text
+
+
+def test_a_phone_key_inside_another_server_is_not_the_entry(home):
+    st.DSH_PATCH.parent.mkdir()
+    st.DSH_PATCH.write_text("- id: mcp-manager\n  config:\n    servers:\n      other:\n        env:\n          phone: '123'\n")
+    st._dsh_add(URL, TOKEN, [])
+    st._dsh_add(URL, TOKEN, [])
+    text = st.DSH_PATCH.read_text()
+    assert "          phone: '123'\n" in text and text.count("      phone:\n") == 1
+
+
+@pytest.mark.parametrize("text", [
+    "- id: mcp-manager\n  config:\n    servers:\n      - name: other\n",
+    "plugins:\n  - id: mcp-manager\n    config: {}\n",
+    "- name: MCP\n  id: mcp-manager\n",
+])
+def test_more_layouts_it_does_not_know_are_left_untouched(home, text):
+    st.DSH_PATCH.parent.mkdir()
+    st.DSH_PATCH.write_text(text)
+    with pytest.raises(st.SetupError):
+        st._dsh_add(URL, TOKEN, [])
+    assert st.DSH_PATCH.read_text() == text
+
+
+def test_a_nested_config_key_is_not_the_items_config(home):
+    st.DSH_PATCH.parent.mkdir()
+    st.DSH_PATCH.write_text("- id: mcp-manager\n  meta:\n    config:\n      a: 1\n  config:\n    servers:\n      other:\n        url: x\n")
+    st._dsh_add(URL, TOKEN, [])
+    lines = st.DSH_PATCH.read_text().splitlines()
+    assert lines.index("      phone:") > lines.index("  config:")  # under the item's own config
+
+
+def test_codex_comments_after_a_phone_table_at_the_end_stay(home):
+    st.CODEX_TOML.parent.mkdir()
+    st.CODEX_TOML.write_text('[mcp_servers.phone]\nurl = "old"\n\n# [mcp_servers.old]\n# command = "x"\n')
+    st._codex_add(URL, TOKEN, [])
+    assert '# [mcp_servers.old]\n# command = "x"\n' in st.CODEX_TOML.read_text()
+
+
+@pytest.mark.parametrize("content", ["null", "[]", '{"codex": 1}'])
+def test_a_record_file_that_is_not_ours_is_reported(home, content):
+    st.STATE.write_text(content)
+    with pytest.raises(st.SetupError):
+        st.stale()

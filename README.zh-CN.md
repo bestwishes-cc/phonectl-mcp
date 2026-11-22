@@ -62,7 +62,7 @@ phonectl doctor            # 检查数据线、信任、开发者模式、磁盘
 phonectl setup claude-code        # 或者：codex、gemini（桌面版）、deepseek-harness
 ```
 
-`setup` 会把服务连同令牌加进这个 Agent 的 MCP 配置，并装上 `phonectl-scripts` skill，里面是和别的 Agent 共用手机的脚本要守的规矩：排队、在两个工作单元之间让出手机、被打断后能接着做。它改动的每个文件都会先备份成 `<文件>.bak`，改完列出改了什么。只输入 `phonectl setup` 会列出它认识的 Agent；`phonectl setup --remove <agent>` 把两样都撤掉。升级 phonectl 之后，`phonectl update` 会更新所有这样装过的 Agent 里的 skill（`doctor` 会提示哪个落后了）；你手动改过的 skill 不会被覆盖。
+`setup` 会把服务连同令牌加进这个 Agent 的 MCP 配置，并装上 `phonectl-scripts` skill，里面是和别的 Agent 共用手机的脚本要守的规矩：排队、在两个工作单元之间让出手机、被打断后能接着做。第一次改动某个文件之前，它会把原文件保存为 `<文件>.phonectl.bak`，改完列出改了什么。只输入 `phonectl setup` 会列出它认识的 Agent；`phonectl setup --remove <agent>` 把两样都撤掉。升级 phonectl 之后，`phonectl update` 会更新所有这样装过的 Agent 里的 skill（`doctor` 会提示哪个落后了）；你手动改过的 skill 不会被覆盖。
 
 **其他客户端手动配置**（`~/.cursor/mcp.json` 等支持 streamable HTTP 的客户端）。这样配置的 Agent 能操作手机，但没有那个 skill：它写的脚本不知道要把手机让给别的 Agent。
 

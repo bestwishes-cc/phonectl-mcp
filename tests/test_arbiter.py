@@ -397,3 +397,43 @@ def test_one_call_running_out_of_waiting_keeps_the_clients_other_call_in_line():
         return [k for k, _ in log]
 
     assert run(main()) == ["b", "c"]  # b's waiting call is still ahead of c
+
+
+def test_a_place_kept_from_before_is_used_up_once_the_client_has_had_its_turn():
+    async def main():
+        arb = Arbiter(idle_s=10, wait_s=5, keep_place_s=5)
+        x, z, w = (arb.client(k, k.upper()) for k in "xzw")
+        log = []
+        await call(arb, z)
+        arb.wait_s = 0.1
+        with pytest.raises(StillWaiting):
+            await call(arb, x)  # x keeps a place at the front
+        arb.wait_s = 5
+        tx = asyncio.create_task(call(arb, x, 0, log))  # x's other call
+        await asyncio.sleep(0.02)
+        assert await arb.release(z)
+        await tx  # x has had its turn
+        tz = asyncio.create_task(call(arb, z, 0, log))
+        tw = asyncio.create_task(call(arb, w, 0, log))
+        await asyncio.sleep(0.05)
+        assert await arb.yield_to_waiter(x)
+        await tz
+        arb.idle_s = 0.05
+        tx2 = asyncio.create_task(call(arb, x, 0, log))  # must not jump ahead of w
+        await asyncio.gather(tw, tx2)
+        return [k for k, _ in log]
+
+    assert run(main()) == ["x", "z", "w", "x"]
+
+
+def test_a_call_cancelled_before_it_reached_the_phone_is_not_sent():
+    async def main():
+        arb = Arbiter(idle_s=10, wait_s=5)
+        a = arb.client("a", "A")
+        gave_up = asyncio.Event()
+        await arb.abandon(gave_up)
+        with pytest.raises(Abandoned):
+            async with arb.use(a, gave_up):
+                pass
+
+    run(main())

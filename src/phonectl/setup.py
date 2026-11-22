@@ -2,7 +2,7 @@
 
 Each agent keeps its MCP servers and its skills in its own place, in its own format; this module
 knows those places for the agents below and writes them the agent's way (its own command where
-it has one). The first time it changes a file, it keeps the original as <file>.bak. What it installed is
+it has one). The first time it changes a file, it keeps the original as <file>.phonectl.bak. What it installed is
 recorded in STATE, so `phonectl update` can bring the skill up to date after an upgrade, and a
 skill the user edited since is left as it is.
 """
@@ -42,10 +42,13 @@ def _run(*cmd: str) -> str:
     return r.stdout
 
 
+BACKUP = ".phonectl.bak"  # its own suffix: a <file>.bak the user or another tool made is not ours
+
+
 def _backup(path: Path, changed: list[str]) -> None:
-    """Keep the file as it was before phonectl first changed it, as <file>.bak. A later run
-    does not overwrite that copy: it would replace the user's original with phonectl's edit."""
-    bak = path.with_name(path.name + ".bak")
+    """Keep the file as it was before phonectl first changed it, as <file>.phonectl.bak. A later
+    run does not overwrite that copy: it would replace the user's original with phonectl's edit."""
+    bak = path.with_name(path.name + BACKUP)
     if path.exists() and not bak.exists():
         shutil.copy2(path, bak)
     changed.append(str(path))
@@ -116,6 +119,11 @@ def _codex_without_phone(text: str) -> str:
                 skipped = []
             skipping = bool(_TABLE.match(line.strip()))
         (skipped if skipping else out).append(line)
+    if skipping:  # the table ran to the end: comments after its last value are not part of it
+        tail = len(skipped)
+        while tail and (not skipped[tail - 1].strip() or skipped[tail - 1].lstrip().startswith("#")):
+            tail -= 1
+        out += skipped[tail:]
     return "".join(out).rstrip("\n") + ("\n" if out else "")
 
 
@@ -183,7 +191,9 @@ class _DshLayout:
     item: int = -1  # the `- id: mcp-manager` line
     end: int = 0  # the line after the item
     config: int = -1
+    sub: int = -1  # indentation of the keys under config
     servers: int = -1
+    block_end: int = -1  # the line after the servers block
     child: int = -1  # indentation of the entries under servers
     phone: int = -1  # the `phone:` line
     phone_end: int = -1  # the line after the phone entry
@@ -191,49 +201,67 @@ class _DshLayout:
 
 def _dsh_layout(lines: list[str]) -> _DshLayout:
     """Read the parts of the file this module edits. Anything written in a way it does not
-    expect (a flow mapping, an inline value, two mcp-manager items) raises SetupError: an
-    edit by guesswork could merge the user's servers into ours or drop them."""
+    expect (a flow mapping, an inline value, a list under servers, an mcp-manager item that is
+    not a top-level `- id: mcp-manager`, two of them) raises SetupError: an edit by guesswork
+    could merge the user's servers into ours, drop them, or leave YAML the harness cannot read."""
     lay = _DshLayout(end=len(lines))
+    for i, line in enumerate(lines):
+        if re.search(r"\bid:\s*mcp-manager\b", line) and not re.match(r"^- id:\s*mcp-manager\s*(#.*)?$", line):
+            raise SetupError(f"{DSH_PATCH} line {i + 1}: the mcp-manager entry is written in a form "
+                             "phonectl does not edit; add the phone server by hand")
     items = [i for i, l in enumerate(lines) if re.match(r"^- id:\s*mcp-manager\s*(#.*)?$", l)]
     if len(items) > 1:
         raise SetupError(f"{DSH_PATCH} has {len(items)} mcp-manager entries; merge them by hand first")
     if not items:
-        if any(re.match(r"^-.*\bmcp-manager\b", l) for l in lines):
-            raise SetupError(f"{DSH_PATCH}: the mcp-manager entry is written in a form phonectl does not edit")
         return lay
     lay.item = items[0]
     lay.end = next((i for i in range(lay.item + 1, len(lines)) if _content(lines[i]) and _indent(lines[i]) == 0),
                    len(lines))
 
-    def key(name: str, start: int, stop: int, deeper_than: int) -> int:
+    def block(start: int, indent: int) -> int:
+        """The line after the block of lines indented deeper than indent, from start on."""
+        return next((i for i in range(start, lay.end) if _content(lines[i]) and _indent(lines[i]) <= indent), lay.end)
+
+    def key(name: str, start: int, stop: int, indent: int) -> int:
+        """The `name:` key directly at this indentation (not one nested deeper), -1 if absent."""
         for i in range(start, stop):
-            if re.match(rf"^\s+{name}:", lines[i]) and _indent(lines[i]) > deeper_than:
+            if _indent(lines[i]) == indent and re.match(rf"^\s+{name}:", lines[i]):
                 if not re.match(rf"^\s+{name}:\s*(#.*)?$", lines[i]):
                     raise SetupError(f"{DSH_PATCH} line {i + 1}: `{name}:` has an inline value; "
                                      "phonectl only edits the block form")
                 return i
         return -1
 
-    lay.config = key("config", lay.item + 1, lay.end, 0)
+    lay.config = key("config", lay.item + 1, lay.end, 2)  # the item's keys line up with `id`
     if lay.config < 0:
         return lay
-    lay.servers = key("servers", lay.config + 1, lay.end, _indent(lines[lay.config]))
+    top = _indent(lines[lay.config])
+    config_end = block(lay.config + 1, top)
+    keys = [i for i in range(lay.config + 1, config_end) if _content(lines[i])]
+    lay.sub = _indent(lines[keys[0]]) if keys else top + 2
+    lay.servers = key("servers", lay.config + 1, config_end, lay.sub)
     if lay.servers < 0:
         return lay
     top = _indent(lines[lay.servers])
-    block_end = next((i for i in range(lay.servers + 1, lay.end)
-                      if _content(lines[i]) and _indent(lines[i]) <= top), lay.end)
-    entries = [i for i in range(lay.servers + 1, block_end) if _content(lines[i])]
+    lay.block_end = block(lay.servers + 1, top)
+    entries = [i for i in range(lay.servers + 1, lay.block_end) if _content(lines[i])]
+    if entries and lines[entries[0]].lstrip().startswith("-"):
+        raise SetupError(f"{DSH_PATCH} line {entries[0] + 1}: servers is a list here, not a mapping; "
+                         "add the phone server by hand")
     lay.child = _indent(lines[entries[0]]) if entries else top + 2
     for i in entries:
         if _indent(lines[i]) == lay.child and re.match(rf"^\s+{NAME}:", lines[i]):
             if not re.match(rf"^\s+{NAME}:\s*(#.*)?$", lines[i]):
                 raise SetupError(f"{DSH_PATCH} line {i + 1}: `{NAME}:` has an inline value; edit it by hand")
             lay.phone = i
-            lay.phone_end = next((j for j in range(i + 1, block_end)
-                                  if _content(lines[j]) and _indent(lines[j]) <= lay.child), block_end)
-            while lay.phone_end > i + 1 and not lines[lay.phone_end - 1].strip():
-                lay.phone_end -= 1  # blank lines after the entry belong to the file, not to it
+            lay.phone_end = next((j for j in range(i + 1, lay.block_end)
+                                  if _content(lines[j]) and _indent(lines[j]) <= lay.child), lay.block_end)
+            # Blank lines after the entry, and comments no deeper than the entries, belong to
+            # what follows (a note above the next server, a server commented out), not to it.
+            while lay.phone_end > i + 1 and (not lines[lay.phone_end - 1].strip() or (
+                    lines[lay.phone_end - 1].lstrip().startswith("#")
+                    and _indent(lines[lay.phone_end - 1]) <= lay.child)):
+                lay.phone_end -= 1
     return lay
 
 
@@ -252,7 +280,8 @@ def _dsh_read() -> list[str]:
 
 def _dsh_write(lines: list[str], changed: list[str]) -> None:
     lay = _dsh_layout(lines)  # never leave a file this module could not read back
-    if lay.phone >= 0 and sum(1 for l in lines[lay.servers:lay.end] if re.match(rf"^\s+{NAME}:", l)) != 1:
+    if lay.phone >= 0 and sum(1 for l in lines[lay.servers + 1:lay.block_end]
+                              if _indent(l) == lay.child and re.match(rf"^\s+{NAME}:", l)) != 1:
         raise SetupError(f"{DSH_PATCH}: the edit would leave more than one `{NAME}` entry; nothing written")
     _backup(DSH_PATCH, changed)
     DSH_PATCH.write_text("".join(lines))
@@ -270,7 +299,7 @@ def _dsh_add(url: str, token: str, changed: list[str]) -> None:
         lines[lay.item + 1:lay.item + 1] = ["  config:\n", "    servers:\n", f"      {_MARK}\n",
                                             *_dsh_entry(6, url, token)]
     elif lay.servers < 0:
-        ind = _indent(lines[lay.config]) + 2
+        ind = lay.sub
         lines[lay.config + 1:lay.config + 1] = [" " * ind + "servers:\n", " " * (ind + 2) + _MARK + "\n",
                                                 *_dsh_entry(ind + 2, url, token)]
     elif lay.phone >= 0:
@@ -323,12 +352,15 @@ def _tree_hash(root: Path) -> Optional[str]:
 def _state() -> dict:
     if not STATE.exists():
         return {}
+    # Not {} on failure: saving over it would forget which skills phonectl installed, and every
+    # one of them would then count as edited by hand and never be updated again.
     try:
-        return json.loads(STATE.read_text())
-    except ValueError:
-        # Not {}: saving over it would forget which skills phonectl installed, and every one
-        # of them would then count as edited by hand and never be updated again.
-        raise SetupError(f"{STATE} is not valid JSON; fix it or delete it (then run setup again)") from None
+        state = json.loads(STATE.read_text())
+    except (OSError, ValueError) as e:
+        raise SetupError(f"cannot read {STATE} ({e}); fix it or delete it, then run setup again") from None
+    if not isinstance(state, dict) or not all(isinstance(v, dict) for v in state.values()):
+        raise SetupError(f"{STATE} is not a record phonectl wrote; fix it or delete it, then run setup again")
+    return state
 
 
 def _save_state(state: dict) -> None:
@@ -369,7 +401,7 @@ def install(name: str, url: str, token: str, force: bool = False) -> list[str]:
     state[name] = {**record, "mcp_url": url}
     _save_state(state)
     return [f"{agent.title}: MCP server '{NAME}' -> {url}; {skill}",
-            *(f"  changed {c} (original kept as {c}.bak)" for c in changed),
+            *(f"  changed {c} (original kept as {c}{BACKUP})" for c in changed),
             f"  to use it: {agent.reload}"]
 
 
@@ -389,7 +421,7 @@ def uninstall(name: str) -> list[str]:
         skill = "no skill to remove"
     _save_state(state)
     return [f"{agent.title}: MCP server '{NAME}' removed; {skill}",
-            *(f"  changed {c} (original kept as {c}.bak)" for c in changed),
+            *(f"  changed {c} (original kept as {c}{BACKUP})" for c in changed),
             f"  then: {agent.reload}"]
 
 

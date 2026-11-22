@@ -262,6 +262,8 @@ class Arbiter:
             if place is not None:
                 place.away_until = None
             else:
+                if abandoned is not None and abandoned.is_set():
+                    raise Abandoned("the client gave up on the call before it reached the phone")
                 if self._may_take(client, self._first_in_line(None)):
                     self._take(client)
                     return
@@ -339,6 +341,9 @@ class Arbiter:
             self._holder = client
             self._new_stretch(now)
             self._last_user = client.label
+            # Its turn has come: places it kept from earlier calls are used up, or it could go
+            # ahead of the line again right after giving the phone up.
+            self._queue = [p for p in self._queue if not (p.client is client and p.away_until is not None)]
         elif not self._active:
             pause = now - self._last_end
             if pause >= self.grace():
