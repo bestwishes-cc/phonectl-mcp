@@ -5,6 +5,8 @@
     phonectl restart             restart it, e.g. after upgrading
     phonectl doctor [--fix]      check every link from the cable to the server, say what to do
     phonectl hold 30m | off      keep agents off the phone while you use it by hand
+    phonectl setup <agent>       connect an agent and give it the skill for phone scripts
+    phonectl update              bring every agent set up here to this version's skill
 """
 
 from __future__ import annotations
@@ -84,14 +86,15 @@ def _port_open(host: str, port: int) -> bool:
 
 
 def _client_help(url: str, token_path: Path) -> str:
+    from . import setup as st
+
+    names = " | ".join(st.AGENTS)
     return f"""
-Connect a client (the URL and the token header are all it needs):
+Connect an agent, with the skill for scripts that share the phone:
 
-  Claude Code:
-    claude mcp add --scope user --transport http phone {url} \\
-      --header "Authorization: Bearer $(cat {token_path})"
+  phonectl setup <{names}>
 
-  Any other MCP client with streamable HTTP:
+Any other MCP client with streamable HTTP (the phone only, without the skill):
     url:     {url}
     header:  Authorization: Bearer <contents of {token_path}>
 """
@@ -344,6 +347,11 @@ async def _doctor(fix: bool) -> int:
     else:
         r.fail("the server is up but cannot reach the phone:\n        " + status.replace("\n", "\n        "),
                "Replug the cable, unlock the phone, then `phonectl restart`.")
+    from . import setup as st
+
+    if old := st.stale():
+        r.warn(f"the phonectl-scripts skill is older than this version for: {', '.join(old)}",
+               "Run `phonectl update`.")
     print("\nAll good." if not r.failed else "\nFix the FAIL lines above, then run `phonectl doctor` again.")
     return 1 if r.failed else 0
 
@@ -392,6 +400,49 @@ def hold(args) -> int:
     return 0
 
 
+def _connection():
+    """The URL and token the service uses."""
+    _use_service_env()
+    srv = _server_settings()
+    return f"http://{srv.HTTP_HOST}:{srv.HTTP_PORT}/mcp", srv._load_token(srv.TOKEN_PATH)
+
+
+def setup_agents(args) -> int:
+    from . import setup as st
+
+    if not args.agents:
+        done = st.installed()
+        print("Agents phonectl can set up (phonectl setup <name>):")
+        for name, agent in st.AGENTS.items():
+            where = "set up" if name in done else ("found" if agent.found() else "not found")
+            print(f"  {name:18} {agent.title} ({where})")
+        return 0
+    unknown = [a for a in args.agents if a not in st.AGENTS]
+    if unknown:
+        print(f"Unknown agent: {', '.join(unknown)}. Known: {', '.join(st.AGENTS)}")
+        return 1
+    url, token = _connection()
+    failed = False
+    for name in args.agents:
+        try:
+            lines = st.uninstall(name) if args.remove else st.install(name, url, token, args.force)
+        except (st.SetupError, OSError, ValueError) as e:
+            lines, failed = [f"{st.AGENTS[name].title}: not done: {e}"], True
+        print("\n".join(lines))
+    return 1 if failed else 0
+
+
+def update(_args) -> int:
+    from . import setup as st
+
+    names = st.installed()
+    if not names:
+        print("No agent was set up with `phonectl setup` yet.")
+        return 0
+    args = argparse.Namespace(agents=names, remove=False, force=False)
+    return setup_agents(args)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="phonectl", description="Set up and check the phonectl MCP server.")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -404,6 +455,12 @@ def main() -> None:
     h = sub.add_parser("hold", help="keep agents off the phone while you use it (e.g. 30m; off ends it)")
     h.add_argument("duration", help="how long: 30m, 90s, 1h, or off")
     h.set_defaults(fn=hold)
+    s = sub.add_parser("setup", help="connect an agent to the server and give it the skill for phone scripts")
+    s.add_argument("agents", nargs="*", help="claude-code, codex, gemini, deepseek-harness; none: list them")
+    s.add_argument("--remove", action="store_true", help="take the server and the skill out of the agent again")
+    s.add_argument("--force", action="store_true", help="replace a skill that was changed by hand")
+    s.set_defaults(fn=setup_agents)
+    sub.add_parser("update", help="update the skill in every agent set up here").set_defaults(fn=update)
     args = ap.parse_args()
     sys.exit(args.fn(args))
 

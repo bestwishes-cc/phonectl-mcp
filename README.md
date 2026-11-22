@@ -56,16 +56,15 @@ phonectl install-service   # runs the server at login on http://127.0.0.1:47321/
 phonectl doctor            # checks cable, trust, Developer Mode, disk image and server
 ```
 
-`install-service` also creates an access token in `~/.config/phonectl/token`. Then add the server to the client you use:
-
-**Claude Code**
+`install-service` also creates an access token in `~/.config/phonectl/token`. Then connect the agent you use, one command per agent:
 
 ```sh
-claude mcp add --scope user --transport http phone http://127.0.0.1:47321/mcp \
-  --header "Authorization: Bearer $(cat ~/.config/phonectl/token)"
+phonectl setup claude-code        # or: codex, gemini (the desktop app), deepseek-harness
 ```
 
-**Cursor** (`~/.cursor/mcp.json`) and other clients with streamable HTTP
+`setup` adds the server to the agent's MCP config, with the token, and installs the `phonectl-scripts` skill: the rules for a script that shares the phone (wait in line, yield between units of work, survive being interrupted). It backs up every file it changes as `<file>.bak` and prints what it changed. `phonectl setup` alone lists the agents it knows; `phonectl setup --remove <agent>` takes both out again. After upgrading phonectl, `phonectl update` brings the skill up to date in every agent set up this way (`doctor` says when one is behind); a skill you edited by hand is left as it is.
+
+**Other clients by hand** (`~/.cursor/mcp.json` and others with streamable HTTP). This gives the agent the phone, but not the skill: scripts it writes will not know to yield the phone to other agents.
 
 ```json
 {

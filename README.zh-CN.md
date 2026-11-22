@@ -56,16 +56,15 @@ phonectl install-service   # 开机自启服务，地址 http://127.0.0.1:47321/
 phonectl doctor            # 检查数据线、信任、开发者模式、磁盘镜像和服务
 ```
 
-`install-service` 还会在 `~/.config/phonectl/token` 生成访问令牌。然后把服务加进你用的那个客户端：
-
-**Claude Code**
+`install-service` 还会在 `~/.config/phonectl/token` 生成访问令牌。然后连接你用的 Agent，每个 Agent 一条命令：
 
 ```sh
-claude mcp add --scope user --transport http phone http://127.0.0.1:47321/mcp \
-  --header "Authorization: Bearer $(cat ~/.config/phonectl/token)"
+phonectl setup claude-code        # 或者：codex、gemini（桌面版）、deepseek-harness
 ```
 
-**Cursor**（`~/.cursor/mcp.json`）及其他支持 streamable HTTP 的客户端
+`setup` 会把服务连同令牌加进这个 Agent 的 MCP 配置，并装上 `phonectl-scripts` skill，里面是和别的 Agent 共用手机的脚本要守的规矩：排队、在两个工作单元之间让出手机、被打断后能接着做。它改动的每个文件都会先备份成 `<文件>.bak`，改完列出改了什么。只输入 `phonectl setup` 会列出它认识的 Agent；`phonectl setup --remove <agent>` 把两样都撤掉。升级 phonectl 之后，`phonectl update` 会更新所有这样装过的 Agent 里的 skill（`doctor` 会提示哪个落后了）；你手动改过的 skill 不会被覆盖。
+
+**其他客户端手动配置**（`~/.cursor/mcp.json` 等支持 streamable HTTP 的客户端）。这样配置的 Agent 能操作手机，但没有那个 skill：它写的脚本不知道要把手机让给别的 Agent。
 
 ```json
 {

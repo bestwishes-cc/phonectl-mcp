@@ -607,6 +607,11 @@ def _serve_http() -> None:
 
     arbiter.assume_used_before()  # clients may have used the phone through a server before this one
     logtrim.keep_trimmed()  # the service logs every call; launchd's log files would only grow
+    from . import setup
+
+    if old := setup.stale():
+        log.warning("the phonectl-scripts skill is older than this version for %s: run `phonectl update`",
+                    ", ".join(old))
 
     hosts = [f"{HTTP_HOST}:{HTTP_PORT}", f"localhost:{HTTP_PORT}"]
     app = mcp.streamable_http_app(
