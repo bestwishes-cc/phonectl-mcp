@@ -144,6 +144,8 @@ def _tool(kind: str):
                         shot = call.arguments.get("screenshot", False)
                         if kind == BLIND and lease.stale_by:
                             if arbiter.sharing:
+                                log.info("%s: %s NOT DONE (%s used the phone since its last look)",
+                                         client.label, fn.__name__, lease.stale_by)
                                 return _not_done(lease)
                             log.warning("crossed input: %s: %s after %s used the phone since its last look",
                                         client.label, fn.__name__, lease.stale_by)
