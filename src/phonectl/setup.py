@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import tomllib
@@ -337,9 +338,11 @@ _DONE = "/phonectl/done"  # in every hook command phonectl writes: how its own h
 
 
 def _hook_command(url: str, token_path: Path) -> str:
+    """A sh command that never fails the agent's turn: it prints {} and exits 0 whatever happens
+    (no curl, no server, a path with quotes in it)."""
     base = url.rsplit("/mcp", 1)[0]
-    return (f"curl -s -m 3 -o /dev/null -X POST -H \"Authorization: Bearer $(cat '{token_path}')\" "
-            f"'{base}{_DONE}'; echo '{{}}'")
+    header = shlex.quote("Authorization: Bearer ") + f'"$(cat {shlex.quote(str(token_path))} 2>/dev/null)"'
+    return f"curl -s -m 3 -o /dev/null -X POST -H {header} {shlex.quote(base + _DONE)} >/dev/null 2>&1; echo '{{}}'"
 
 
 def _ours(handler: object) -> bool:
@@ -364,32 +367,38 @@ def _write_json(path: Path, data: dict, changed: list[str]) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
-# Claude Code: Stop (its turn ended) and SubagentStop (a subagent, e.g. one that drove the
-# phone, finished) in ~/.claude/settings.json, next to whatever hooks are there already.
+# Claude Code: Stop (its turn ended) in ~/.claude/settings.json, next to whatever hooks are
+# there already. Not SubagentStop: a subagent that finishes (one that read code, say) does not
+# mean another one, or the session, is done with the phone.
 CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
-_CLAUDE_EVENTS = ("Stop", "SubagentStop")
+_CLAUDE_EVENTS = ("Stop",)
+_CLAUDE_OLD_EVENTS = ("Stop", "SubagentStop")  # where earlier versions put it: taken out of both
 
 
 def _claude_unhook(data: dict) -> dict:
+    """data without phonectl's hooks; everything else, empty lists included, as it was."""
     hooks = data.get("hooks")
     if not isinstance(hooks, dict):
         return data
-    for event in _CLAUDE_EVENTS:
+    emptied = False
+    for event in _CLAUDE_OLD_EVENTS:
         groups = hooks.get(event)
         if not isinstance(groups, list):
             continue
-        kept = []
+        kept, removed = [], False
         for g in groups:
-            if isinstance(g, dict) and isinstance(g.get("hooks"), list):
+            if isinstance(g, dict) and isinstance(g.get("hooks"), list) and any(_ours(h) for h in g["hooks"]):
+                removed = True
                 g = {**g, "hooks": [h for h in g["hooks"] if not _ours(h)]}
                 if not g["hooks"]:
                     continue
             kept.append(g)
-        if kept:
-            hooks[event] = kept
-        else:
+        if removed and not kept:
             del hooks[event]
-    if not hooks:
+            emptied = True
+        elif removed:
+            hooks[event] = kept
+    if emptied and not hooks:
         del data["hooks"]
     return data
 
@@ -400,13 +409,21 @@ def _claude_hook(command: str, changed: list[str]) -> None:
     if not isinstance(hooks, dict):
         raise SetupError(f"{CLAUDE_SETTINGS}: hooks is not an object; fix it first")
     for event in _CLAUDE_EVENTS:
-        hooks.setdefault(event, []).append({"hooks": [{"type": "command", "command": command, "timeout": 5}]})
+        groups = hooks.setdefault(event, [])
+        if not isinstance(groups, list):
+            raise SetupError(f"{CLAUDE_SETTINGS}: hooks.{event} is not a list; fix it first")
+        groups.append({"hooks": [{"type": "command", "command": command, "timeout": 5}]})
     _write_json(CLAUDE_SETTINGS, data, changed)
 
 
 def _claude_unhook_file(changed: list[str]) -> None:
-    if CLAUDE_SETTINGS.exists():
-        _write_json(CLAUDE_SETTINGS, _claude_unhook(_load_json(CLAUDE_SETTINGS)), changed)
+    if not CLAUDE_SETTINGS.exists():
+        return
+    data = _load_json(CLAUDE_SETTINGS)
+    before = json.dumps(data)
+    data = _claude_unhook(data)
+    if json.dumps(data) != before:  # leave the file as it is when none of ours was in it
+        _write_json(CLAUDE_SETTINGS, data, changed)
 
 
 # Gemini (agy): a named hook in ~/.gemini/config/hooks.json; Stop fires when its turn ends.

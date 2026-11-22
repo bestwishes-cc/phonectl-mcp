@@ -151,7 +151,7 @@ def _tool(kind: str):
                 _waiting.setdefault(key, []).append(gave_up)
                 asked = time.monotonic()
                 try:
-                    async with arbiter.use(client, gave_up, pid=pid, changes_screen=kind not in (LOOK, CLIP)) as lease:
+                    async with arbiter.use(client, gave_up, pid=pid) as lease:
                         _unlist(key, gave_up)  # it has the phone: a cancel now ends nothing
                         got = time.monotonic()
                         call = sig.bind(*args, **kwargs)
@@ -167,10 +167,15 @@ def _tool(kind: str):
                                 return _not_done(lease)
                             log.warning("crossed input: %s: %s after %s used the phone since its last look",
                                         client.label, fn.__name__, lease.stale_by)
+                        if kind not in (LOOK, CLIP):
+                            arbiter.acting(lease)
                         result = await fn(*args, **kwargs)
                         if kind in (LOOK, AIMED) or (kind == NAV and shot):
                             arbiter.saw_screen(lease)
-                        elif fn.__name__ == "launch_app":
+                        elif fn.__name__ == "launch_app" and (call.arguments.get("restart") or call.arguments.get("url")):
+                            # Restarted, or sent to a link of its own: what is in front is the
+                            # caller's. A plain launch_app brings the app back as it was, maybe
+                            # on a page another client left it on.
                             arbiter.relaunched(lease)
                         log.info("%s: %s done (waited %.1f s, ran %.1f s)", client.label, fn.__name__,
                                  got - asked, time.monotonic() - got)
@@ -506,8 +511,10 @@ async def _admin(scope, receive, send) -> None:
             break
     headers = dict(scope["headers"])
     name = headers.get(b"x-phonectl-client", b"").decode() or None
-    client, own, _ = await identify(arbiter, scope.get("client"), name)
     route = (scope["method"], scope["path"][len(_ADMIN):])
+    # The end-of-turn hook of every session calls done; only one that has used the phone has
+    # a client to find, and no record is made for the others.
+    client, own, _ = await identify(arbiter, scope.get("client"), name, create=route != ("POST", "done"))
     status, out = 200, {}
     try:
         if route == ("GET", "use"):
@@ -519,7 +526,7 @@ async def _admin(scope, receive, send) -> None:
         elif route == ("POST", "done"):
             # Sent by an agent's end-of-turn hook, a process the agent started: unlike release,
             # it gives up the phone of the agent that started it.
-            out = {"released": await arbiter.release(client)}
+            out = {"released": client is not None and await arbiter.done(client)}
         elif route == ("POST", "yield"):
             # Unlike release, a script started by the client may yield for it: the script is the
             # one using the phone, between two of its units of work.

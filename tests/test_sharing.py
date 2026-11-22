@@ -291,7 +291,10 @@ def test_text_taps_need_a_look_or_the_clients_own_app_after_someone_changed_the_
     b.tap(1, 1)  # b changes the screen
     with pytest.raises(ScreenChanged):
         a.tap_text("OK")  # "OK" may now be a button in b's app
-    a.launch_app("com.example.mine")  # a brings its own app back
+    a.launch_app("com.example.mine")  # a plain launch shows the app as it was: maybe b's page
+    with pytest.raises(ScreenChanged):
+        a.tap_text("OK")
+    a.launch_app("com.example.mine", restart=True)  # restarted: what is in front is a's
     with pytest.raises(TextTimeout):
         a.tap_text("OK")  # let through: the fake screen just has no text
 

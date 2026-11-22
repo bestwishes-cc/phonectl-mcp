@@ -11,9 +11,12 @@ def run(coro):
     return asyncio.run(coro)
 
 
-async def call(arb, client, seconds=0.0, log=None):
-    """One tool call by client that takes `seconds` while holding the phone."""
+async def call(arb, client, seconds=0.0, log=None, acts=True):
+    """One tool call by client that takes `seconds` while holding the phone; with acts, one that
+    changes the screen (a tap), else one that only looks."""
     async with arb.use(client) as lease:
+        if acts:
+            arb.acting(lease)
         if log is not None:
             log.append((client.key, time.monotonic()))
         await asyncio.sleep(seconds)
@@ -476,18 +479,16 @@ def test_the_grace_is_three_times_the_longest_pause():
     assert 0.44 < run(main()) < 0.6  # 3 x 0.15, not shrunk by the quick ones
 
 
-def test_a_holder_that_only_looked_does_not_keep_the_phone():
+def test_a_holder_that_only_looked_keeps_the_phone_only_for_the_shortest_grace():
     async def main():
-        arb = Arbiter(idle_s=10, wait_s=5)
+        arb = Arbiter(idle_s=10, wait_s=5, grace_min_s=0.2, grace_start_s=5)
         a, b = arb.client("a", "A"), arb.client("b", "B")
-        async with arb.use(a, changes_screen=False):
-            pass
-        assert arb.describe() == "free"
+        await call(arb, a, acts=False)
         t0 = time.monotonic()
         await call(arb, b)
         return time.monotonic() - t0
 
-    assert run(main()) < 0.1
+    assert 0.15 < run(main()) < 0.6  # the shortest grace, not the 5 s before a first pause
 
 
 def test_looking_does_not_make_anyone_look_again():
@@ -495,7 +496,7 @@ def test_looking_does_not_make_anyone_look_again():
         arb = Arbiter(idle_s=0.01, wait_s=5)
         a, b = arb.client("a", "A"), arb.client("b", "B")
         arb.saw_screen(await call(arb, a))
-        async with arb.use(b, changes_screen=False):
+        async with arb.use(b):
             pass
         return (await call(arb, a)).stale_by
 
@@ -510,9 +511,9 @@ def test_what_was_seen_is_kept_per_process():
         agent = arb.client("pid:1", "agent", 1)
         async with arb.use(agent, pid=1) as lease:
             arb.saw_screen(lease)
-        async with arb.use(agent, pid=2):  # the script taps
-            pass
-        async with arb.use(agent, pid=2, changes_screen=False) as lease:
+        async with arb.use(agent, pid=2) as lease:  # the script taps
+            arb.acting(lease)
+        async with arb.use(agent, pid=2) as lease:
             arb.saw_screen(lease)  # and looks
         async with arb.use(agent, pid=1) as lease:
             return lease.stale_by
@@ -533,3 +534,74 @@ def test_opening_its_own_app_again_is_remembered_until_it_looks():
         return after_launch.stale_by, after_launch.relaunched, (await call(arb, a)).relaunched
 
     assert run(main()) == ("B", True, False)
+
+
+def test_someone_elses_change_undoes_an_app_opened_again():
+    async def main():
+        arb = Arbiter(idle_s=0.01, wait_s=5)
+        a, b = arb.client("a", "A"), arb.client("b", "B")
+        arb.saw_screen(await call(arb, a))
+        await call(arb, b)
+        arb.relaunched(await call(arb, a))  # a opens its app again
+        await call(arb, b)  # then b changes the screen once more
+        return (await call(arb, a)).relaunched
+
+    assert run(main()) is False
+
+
+def test_a_new_process_starts_from_what_its_client_last_saw():
+    # A tool that runs once per call looks in one process and taps in the next.
+    async def main():
+        arb = Arbiter(idle_s=0.01, wait_s=5)
+        a, b = arb.client("a", "A"), arb.client("b", "B")
+        await call(arb, b)  # someone changed the screen before
+        async with arb.use(a, pid=11) as lease:
+            arb.saw_screen(lease)  # process 11 looks, then exits
+        async with arb.use(a, pid=12) as lease:  # process 12 taps
+            fresh = lease.stale_by
+        await call(arb, b)
+        async with arb.use(a, pid=13) as lease:
+            return fresh, lease.stale_by
+
+    assert run(main()) == (None, "B")
+
+
+def test_a_refused_call_changes_nothing():
+    async def main():
+        arb = Arbiter(idle_s=0.01, wait_s=5)
+        a, b = arb.client("a", "A"), arb.client("b", "B")
+        arb.saw_screen(await call(arb, b, acts=False))
+        async with arb.use(a):  # a's blind tap is refused: no acting()
+            pass
+        return (await call(arb, b)).stale_by
+
+    assert run(main()) is None
+
+
+def test_a_holder_that_only_looked_yields_to_the_line_not_to_a_newcomer():
+    async def main():
+        arb = Arbiter(idle_s=10, wait_s=5)
+        a, b = arb.client("a", "A"), arb.client("b", "B")
+        arb.saw_screen(await call(arb, b, acts=False))  # b only looked, and thinks
+        t0 = time.monotonic()
+        with pytest.raises(StillWaiting):
+            arb.wait_s = 0.2
+            await call(arb, a)  # a newcomer does not take it at once...
+        return time.monotonic() - t0
+
+    assert run(main()) >= 0.2
+
+
+def test_the_end_of_turn_hook_does_not_free_a_phone_a_running_script_is_using():
+    async def main():
+        import os
+        arb = Arbiter(idle_s=10, wait_s=5)
+        agent = arb.client("pid:1", "agent", 1)
+        async with arb.use(agent, pid=os.getpid()) as lease:  # a script of the agent, still running
+            arb.acting(lease)
+        kept = not await arb.done(agent)
+        async with arb.use(agent, pid=1) as lease:  # the agent itself
+            arb.acting(lease)
+        return kept, await arb.done(agent)
+
+    assert run(main()) == (True, True)

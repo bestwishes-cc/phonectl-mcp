@@ -86,6 +86,10 @@ class Client:
     label: str  # shown to other clients and in the log
     seen: float = 0.0  # monotonic time of the last call
     pid: Optional[int] = None  # its process, when known: once that exits, it holds nothing
+    # The screen version (Arbiter._version) any of its processes last looked at: what a new
+    # process of it starts from (a tool run once per call is a new process every time).
+    looked_at: Optional[int] = None
+    last_pid: Optional[int] = None  # the process of its latest call
 
 
 @dataclass(eq=False)
@@ -161,10 +165,12 @@ class Arbiter:
         # Who changed the screen last; a process seen for the first time has not looked since.
         self._last_user: Optional[str] = None
         self._views: dict[tuple[str, int], _View] = {}  # (client key, pid or 0) -> what it saw
+        self._version = 0  # how many times the screen was changed
+        self._last_changer: Optional[str] = None  # the key of the client that changed it last
         # The longest pause between the holder's calls in its current stretch of use.
         self._longest: Optional[float] = None
         # Whether the holder changed the screen in its current stretch. One that only looked has
-        # nothing on the screen to lose: someone waiting may have the phone at once.
+        # nothing on the screen to lose: it gets the shortest grace (see grace()).
         self._acted = False
 
     def assume_used_before(self) -> None:
@@ -172,23 +178,36 @@ class Arbiter:
         first blind input has to be preceded by a look."""
         self._last_user = self._last_user or "someone before this server started"
 
+    def _by(self, label: str, changer: Optional[str], viewer: str) -> str:
+        if changer == viewer:
+            return f"{label}, in another process of yours (a script or helper you ran)"
+        return label
+
     def _view(self, client: Client, pid: Optional[int]) -> _View:
         key = (client.key, pid or 0)
         v = self._views.get(key)
         if v is None:
-            # New, or its client was forgotten: it has not seen what the last user left.
-            v = self._views[key] = _View(stale_by=self._last_user)
+            # A new process starts from what its client last saw: fresh if one of the client's
+            # processes has looked since the screen last changed (a tool that runs once per call
+            # looks in one process and taps in the next), else it has not seen what changed.
+            fresh = client.looked_at is not None and client.looked_at == self._version
+            stale = None if fresh or self._last_user is None else \
+                self._by(self._last_user, self._last_changer, client.key)
+            v = self._views[key] = _View(stale_by=stale)
         return v
 
     def _changed(self, by: Client, view: Optional[_View]) -> None:
         """by (in the process whose view is `view`) is about to change the screen: every other
-        process has to look again before a blind input."""
+        process has to look again before a blind input, and an app it opened is no longer
+        known to be in front."""
         for (key, _), v in self._views.items():
             if v is view:
                 continue
-            v.stale_by = by.label if key != by.key else f"{by.label}, in another process of yours (a script or helper you ran)"
+            v.stale_by = self._by(by.label, by.key, key)
             v.changes += 1
-        self._last_user = by.label
+            v.relaunched = False
+        self._version += 1
+        self._last_user, self._last_changer = by.label, by.key
 
     # --- identity -----------------------------------------------------------------------
 
@@ -203,7 +222,7 @@ class Arbiter:
                   and not any(p.client is c for p in self._queue)]:
             del self._clients[k]
         for k in [k for k in self._views
-                  if k[0] not in self._clients or (k[1] and k[0] != key and not _alive(k[1]))]:
+                  if k[0] not in self._clients or (k[1] and not _alive(k[1]))]:
             del self._views[k]  # forgotten clients, and processes that have exited
         c = self._clients.get(key)
         if c is None:
@@ -222,6 +241,11 @@ class Arbiter:
         the same agent thinks longer on one task than another. The longest pause, not an average:
         a run of quick steps must not shrink the grace below the occasional long thought, or the
         phone is taken from an agent in the middle of its task."""
+        if not self._acted:
+            # It has only looked: nothing of its is on the screen to lose, so the shortest grace.
+            # Not none at all: then a newcomer could take the phone from every waiter that got
+            # its turn and is still looking, and two waiters that only look would trade it.
+            return min(self.idle_s, self.grace_min_s)
         estimate = self.grace_start_s if self._longest is None else 3 * self._longest
         return min(self.idle_s, max(self.grace_min_s, estimate))
 
@@ -236,16 +260,15 @@ class Arbiter:
 
     @asynccontextmanager
     async def use(self, client: Client, abandoned: Optional[asyncio.Event] = None, *,
-                  pid: Optional[int] = None, changes_screen: bool = True) -> AsyncIterator[Lease]:
+                  pid: Optional[int] = None) -> AsyncIterator[Lease]:
         """Hold the phone for one call, waiting in line for it if someone else has it. Raises
         StillWaiting after wait_s, and Abandoned once `abandoned` is set (see abandon()). pid is
-        the calling process (what it has seen is kept per process); changes_screen is False for a
-        call that only looks."""
-        await self._acquire(client, abandoned, changes_screen)
+        the calling process (what it has seen is kept per process). A call that goes on to
+        change the screen says so with acting(), once it has passed its checks."""
+        await self._acquire(client, abandoned)
         view = self._view(client, pid)
+        client.last_pid = pid
         lease = Lease(client, view, view.stale_by, view.changes, view.relaunched)
-        if changes_screen:
-            self._changed(client, view)
         try:
             yield lease
         finally:
@@ -261,11 +284,20 @@ class Arbiter:
             flag.set()
             self._cond.notify_all()
 
+    def acting(self, lease: Lease) -> None:
+        """The call is about to change the screen (it passed its checks; a refused call changes
+        nothing): every other process has to look again, and the holder now has something on
+        the screen to keep."""
+        self._changed(lease.client, lease.view)
+        if self._holder is lease.client:
+            self._acted = True
+
     def saw_screen(self, lease: Lease) -> None:
         """The call looked at the screen: the process's coordinates are current, unless the
         screen was changed by someone else while the call ran (the person took the phone)."""
         if lease.view.changes == lease.changes:
             lease.view.stale_by, lease.view.relaunched = None, False
+            lease.client.looked_at = self._version
 
     def relaunched(self, lease: Lease) -> None:
         """The call opened an app: text the process finds on the screen is in its own app again."""
@@ -301,12 +333,12 @@ class Arbiter:
         return min((p.away_since + self.retry_hold_s for p in self._queue
                     if p.away_until is not None and now - p.away_since < self.retry_hold_s), default=float("inf"))
 
-    async def _acquire(self, client: Client, abandoned: Optional[asyncio.Event], changes_screen: bool) -> None:
+    async def _acquire(self, client: Client, abandoned: Optional[asyncio.Event]) -> None:
         async with self._cond:
             now = self._clock()
             self._drop_expired(now)
             if not self.sharing:
-                self._take(client, changes_screen)
+                self._take(client)
                 return
             # A call of this client ran out of waiting before: this one takes that place.
             place = next((p for p in self._queue if p.client is client and p.away_until is not None), None)
@@ -316,7 +348,7 @@ class Arbiter:
                 if abandoned is not None and abandoned.is_set():
                     raise Abandoned("the client gave up on the call before it reached the phone")
                 if self._may_take(client, self._first_in_line(None)):
-                    self._take(client, changes_screen)
+                    self._take(client)
                     return
                 place = _Place(client)
                 self._queue.append(place)
@@ -333,8 +365,12 @@ class Arbiter:
                         place.away_until, place.away_since = now + self.keep_place_s, now
                         raise StillWaiting(self._wait_detail(), self._queue.index(place) + 1, self.keep_place_s)
                     # Wake for a release, a call ending, the holder's pause running out, or a
-                    # place ahead no longer holding the line.
-                    wake = min(deadline, self._free_at(), self._window_ends(now))
+                    # place ahead no longer holding the line. A phone free now but not to this
+                    # call is held by such a place: its window's end is the next chance.
+                    free = self._free_at()
+                    if free <= now:
+                        free = self._window_ends(now)
+                    wake = min(deadline, free, self._window_ends(now))
                     try:
                         async with asyncio.timeout(max(wake - now, 0.01)):
                             await self._cond.wait()
@@ -344,7 +380,7 @@ class Arbiter:
                 if place.away_until is None:  # got the phone, or gave up: out of the line
                     self._queue.remove(place)
                 self._cond.notify_all()
-            self._take(client, changes_screen)
+            self._take(client)
 
     def _may_take(self, client: Client, first_in_line: bool) -> bool:
         now = self._clock()
@@ -359,7 +395,7 @@ class Arbiter:
         if self._active:
             return False
         paused = now - self._last_end
-        done = (not self._acted or paused >= self.grace() or now - self._held_since >= self.max_hold_s
+        done = (paused >= self.grace() or now - self._held_since >= self.max_hold_s
                 or self._holder_exited())
         return first_in_line and done
 
@@ -376,14 +412,12 @@ class Arbiter:
             return self._clock()
         if self._active:
             return float("inf")
-        if not self._acted:
-            return self._clock()  # it only looked: nothing of its on the screen to keep
         free = min(self._last_end + self.grace(), self._held_since + self.max_hold_s)
         if self._holder.pid is not None:
             free = min(free, self._clock() + _EXIT_POLL_S)  # look again whether it has exited
         return free
 
-    def _take(self, client: Client, changes_screen: bool = True) -> None:
+    def _take(self, client: Client) -> None:
         now = self._clock()
         if self._holder is not client:
             if self._holder is not None:
@@ -403,15 +437,16 @@ class Arbiter:
                 self._acted = False
             else:
                 self._note_pause(pause)
-        self._acted = self._acted or changes_screen
         self._active += 1
         client.seen = now
 
     # --- giving the phone up, and the person ----------------------------------------------
 
     async def release(self, client: Client) -> bool:
-        """Give the phone up now instead of after a pause. False if this client did not hold it."""
+        """Give the phone up now instead of after a pause. False if this client did not hold it.
+        Places it kept in line are given up too: it is done."""
         async with self._cond:
+            self._queue = [p for p in self._queue if not (p.client is client and p.away_until is not None)]
             if self._holder is not client:
                 return False
             if self._active:
@@ -420,6 +455,15 @@ class Arbiter:
             self._cond.notify_all()
             log.info("%s released the phone", client.label)
             return True
+
+    async def done(self, client: Client) -> bool:
+        """The client's turn ended (its end-of-turn hook): give the phone up, unless its latest
+        call came from another process of it that is still running (a script it left working
+        in the background)."""
+        last = client.last_pid
+        if last is not None and last != client.pid and _alive(last):
+            return False
+        return await self.release(client)
 
     async def yield_to_waiter(self, client: Client) -> bool:
         """Between two units of work: give the phone up if someone else is waiting for it, else
@@ -471,7 +515,7 @@ class Arbiter:
             return f"held for the person using it for another {self._person_until - now:.0f} s (phonectl hold)"
         h = self._holder
         grace = self.grace()
-        if h is None or (not self._active and (now - self._last_end >= grace or not self._acted)):
+        if h is None or (not self._active and now - self._last_end >= grace):
             line = "free"
         else:
             who = "you" if viewer is h else h.label
@@ -538,7 +582,7 @@ def _peer_process(port: int) -> Optional[_Peer]:
 
 
 async def identify(arbiter: Arbiter, peer: Optional[tuple[str, int]],
-                   name: Optional[str]) -> tuple[Client, bool, Optional[int]]:
+                   name: Optional[str], create: bool = True) -> tuple[Optional[Client], bool, Optional[int]]:
     """The client behind a request (its X-Phonectl-Client name, else its process), whether the
     request is the client's own (False for a process the client started, which acts as the
     client but must not give up the phone the client holds), and the process that sent it."""
@@ -556,18 +600,24 @@ async def identify(arbiter: Arbiter, peer: Optional[tuple[str, int]],
         if hit is not None:
             hit.expiry = now + _PEER_TTL_S
     pid = hit.pid if hit is not None else None
+
+    def get(key: str, label: str, own_pid: Optional[int] = None) -> Optional[Client]:
+        if not create and arbiter.known(key) is None:
+            return None
+        return arbiter.client(key, label, own_pid)
+
     if name:
         # Told apart by name, but its process is known too: when it exits, it holds nothing.
         name = name.strip()[:60]
-        return arbiter.client(f"name:{name}", name, pid), True, pid
+        return get(f"name:{name}", name, pid), True, pid
     if peer is None:
-        return arbiter.client("local", "the local client"), True, None
+        return get("local", "the local client"), True, None
     if hit is None:
         # One record per host, not per connection: a client reconnecting on a new port is
         # still the same client (all of them are on 127.0.0.1, so they share it).
-        return arbiter.client(f"addr:{peer[0]}", f"a client at {peer[0]}"), True, None
+        return get(f"addr:{peer[0]}", f"a client at {peer[0]}"), True, None
     for p in [hit.pid, *hit.ancestors]:  # the process itself, else the nearest client that started it
         c = arbiter.known(f"pid:{p}")
         if c is not None:
             return arbiter.client(c.key, c.label), p == hit.pid, hit.pid
-    return arbiter.client(f"pid:{hit.pid}", hit.label, hit.pid), True, hit.pid
+    return get(f"pid:{hit.pid}", hit.label, hit.pid), True, hit.pid
