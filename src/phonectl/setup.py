@@ -65,6 +65,10 @@ class Agent:
     add: Callable[[str, str, list[str]], None]  # (url, token, changed files)
     remove: Callable[[list[str]], None]
     reload: str  # what the user does for the agent to see the change
+    # Its end-of-turn hook (see _hook_command): (command, changed files) to put it in, and
+    # (changed files) to take it out. None where the agent has no hooks phonectl can set.
+    add_hook: Optional[Callable[[str, list[str]], None]] = None
+    remove_hook: Optional[Callable[[list[str]], None]] = None
 
 
 def _which(*candidates: str) -> Optional[str]:
@@ -322,16 +326,117 @@ def _dsh_remove(changed: list[str]) -> None:
     _dsh_write(lines, changed)
 
 
+# --- end-of-turn hooks ------------------------------------------------------------------
+#
+# When an agent's turn ends, it is done with the phone; without a hook the server only finds
+# that out once the agent has paused for longer than its pace (see arbiter.grace). The hook
+# runs a command that tells the server so (POST /phonectl/done), reading the token from its
+# file so that no settings file holds it.
+
+_DONE = "/phonectl/done"  # in every hook command phonectl writes: how its own hooks are found
+
+
+def _hook_command(url: str, token_path: Path) -> str:
+    base = url.rsplit("/mcp", 1)[0]
+    return (f"curl -s -m 3 -o /dev/null -X POST -H \"Authorization: Bearer $(cat '{token_path}')\" "
+            f"'{base}{_DONE}'; echo '{{}}'")
+
+
+def _ours(handler: object) -> bool:
+    return isinstance(handler, dict) and _DONE in str(handler.get("command", ""))
+
+
+def _load_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except ValueError as e:
+        raise SetupError(f"{path} is not valid JSON ({e}); fix it first") from None
+    if not isinstance(data, dict):
+        raise SetupError(f"{path} is not a JSON object; fix it first")
+    return data
+
+
+def _write_json(path: Path, data: dict, changed: list[str]) -> None:
+    _backup(path, changed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+# Claude Code: Stop (its turn ended) and SubagentStop (a subagent, e.g. one that drove the
+# phone, finished) in ~/.claude/settings.json, next to whatever hooks are there already.
+CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
+_CLAUDE_EVENTS = ("Stop", "SubagentStop")
+
+
+def _claude_unhook(data: dict) -> dict:
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return data
+    for event in _CLAUDE_EVENTS:
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            continue
+        kept = []
+        for g in groups:
+            if isinstance(g, dict) and isinstance(g.get("hooks"), list):
+                g = {**g, "hooks": [h for h in g["hooks"] if not _ours(h)]}
+                if not g["hooks"]:
+                    continue
+            kept.append(g)
+        if kept:
+            hooks[event] = kept
+        else:
+            del hooks[event]
+    if not hooks:
+        del data["hooks"]
+    return data
+
+
+def _claude_hook(command: str, changed: list[str]) -> None:
+    data = _claude_unhook(_load_json(CLAUDE_SETTINGS))
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise SetupError(f"{CLAUDE_SETTINGS}: hooks is not an object; fix it first")
+    for event in _CLAUDE_EVENTS:
+        hooks.setdefault(event, []).append({"hooks": [{"type": "command", "command": command, "timeout": 5}]})
+    _write_json(CLAUDE_SETTINGS, data, changed)
+
+
+def _claude_unhook_file(changed: list[str]) -> None:
+    if CLAUDE_SETTINGS.exists():
+        _write_json(CLAUDE_SETTINGS, _claude_unhook(_load_json(CLAUDE_SETTINGS)), changed)
+
+
+# Gemini (agy): a named hook in ~/.gemini/config/hooks.json; Stop fires when its turn ends.
+AGY_HOOKS = HOME / ".gemini" / "config" / "hooks.json"
+_AGY_HOOK_NAME = "phonectl-release"
+
+
+def _agy_hook(command: str, changed: list[str]) -> None:
+    data = _load_json(AGY_HOOKS)
+    data[_AGY_HOOK_NAME] = {"Stop": [{"type": "command", "command": command, "timeout": 5}]}
+    _write_json(AGY_HOOKS, data, changed)
+
+
+def _agy_unhook(changed: list[str]) -> None:
+    data = _load_json(AGY_HOOKS)
+    if data.pop(_AGY_HOOK_NAME, None) is not None:
+        _write_json(AGY_HOOKS, data, changed)
+
+
 AGENTS = {a.name: a for a in [
     Agent("claude-code", "Claude Code", HOME / ".claude" / "skills",
           lambda: _which("claude") is not None or (HOME / ".claude.json").exists(),
-          _claude_add, _claude_remove, "new sessions see it; in a running one, run /mcp"),
+          _claude_add, _claude_remove, "new sessions see it; in a running one, run /mcp",
+          _claude_hook, _claude_unhook_file),
     Agent("codex", "Codex", HOME / ".codex" / "skills",
           lambda: (HOME / ".codex").exists() or _which("codex") is not None,
           _codex_add, _codex_remove, "restart Codex (or the ChatGPT app)"),
     Agent("gemini", "Gemini (desktop app)", HOME / ".gemini" / "config" / "skills",
           lambda: _which("agy", AGY) is not None,
-          _agy_add, _agy_remove, "start a new Gemini conversation"),
+          _agy_add, _agy_remove, "start a new Gemini conversation", _agy_hook, _agy_unhook),
     Agent("deepseek-harness", "DeepSeek Harness", HOME / ".dsh" / "skills",
           lambda: DSH_PATCH.exists(),
           _dsh_add, _dsh_remove, "nothing: it reloads its config and skills by itself"),
@@ -388,20 +493,27 @@ def _put_skill(agent: Agent, record: dict, force: bool) -> str:
     return f"skill installed in {dest}"
 
 
-def install(name: str, url: str, token: str, force: bool = False) -> list[str]:
-    """Connect agent `name` and give it the skill. Lines to print."""
+def install(name: str, url: str, token: str, force: bool = False,
+            token_path: Optional[Path] = None) -> list[str]:
+    """Connect agent `name`, give it the skill and, where it has hooks, the end-of-turn hook.
+    Lines to print."""
     agent = AGENTS[name]
     state = _state()
     record = state.get(name, {})
     changed: list[str] = []
     agent.add(url, token, changed)
+    if agent.add_hook is not None and token_path is not None:
+        agent.add_hook(_hook_command(url, token_path), changed)
+        hook = "end-of-turn hook set"
+    else:
+        hook = "no end-of-turn hook (the server goes by its pace)"
     skill = _put_skill(agent, record, force)
     if "left as it is" not in skill:
         record = {"version": __version__, "skill_hash": _tree_hash(agent.skills / SKILL)}
     state[name] = {**record, "mcp_url": url}
     _save_state(state)
-    return [f"{agent.title}: MCP server '{NAME}' -> {url}; {skill}",
-            *(f"  changed {c} (original kept as {c}{BACKUP})" for c in changed),
+    return [f"{agent.title}: MCP server '{NAME}' -> {url}; {skill}; {hook}",
+            *(f"  changed {c} (original kept as {c}{BACKUP})" for c in sorted(set(changed))),
             f"  to use it: {agent.reload}"]
 
 
@@ -411,6 +523,8 @@ def uninstall(name: str) -> list[str]:
     record = state.pop(name, {})
     changed: list[str] = []
     agent.remove(changed)
+    if agent.remove_hook is not None:
+        agent.remove_hook(changed)
     dest = agent.skills / SKILL
     if dest.is_dir() and _tree_hash(dest) == record.get("skill_hash"):
         shutil.rmtree(dest)
@@ -421,7 +535,7 @@ def uninstall(name: str) -> list[str]:
         skill = "no skill to remove"
     _save_state(state)
     return [f"{agent.title}: MCP server '{NAME}' removed; {skill}",
-            *(f"  changed {c} (original kept as {c}{BACKUP})" for c in changed),
+            *(f"  changed {c} (original kept as {c}{BACKUP})" for c in sorted(set(changed))),
             f"  then: {agent.reload}"]
 
 

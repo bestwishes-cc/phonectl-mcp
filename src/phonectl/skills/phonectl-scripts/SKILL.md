@@ -23,9 +23,10 @@ counts as that agent and does not wait for it.
 - `WAITING, nothing was done: ...` (an error result): another client has the phone. Call the
   same tool again at once with the same arguments. Each call waits in line up to 50 s, and the
   place in line is kept between calls. This is not a failure: never stop or skip on it.
-- `NOT DONE: ...` (an error result): someone else used the phone since the script last looked,
-  so the input was not sent. Look again (`read_text` or `screenshot`), find the target again,
-  then repeat the input if it still applies.
+- `NOT DONE: ...` (an error result): someone else changed the screen since the script last
+  looked, so the input was not sent. Look again (`read_text` or `screenshot`), find the target
+  again, then repeat the input if it still applies. `tap_text` gets this too, unless the script
+  has opened its own app with `launch_app` since.
 - Any other error result: stop the script and report the text. Do not carry on as if the
   input had landed.
 
@@ -44,7 +45,9 @@ async def call(phone, tool, **args):
 ```
 
 **Look before a blind input.** `tap` at coordinates, `swipe`, `long_press` and `type_text` act
-on what an earlier look showed. Prefer `tap_text`, which finds its target itself.
+on what an earlier look showed. Prefer `tap_text`, which finds its target itself. The script's
+own process counts here, not the agent that started it: start with `launch_app` and a look,
+never with a tap at coordinates the agent read.
 
 **Work in units, and give the phone up between them.** A unit is one piece of work that stands
 on its own: one application sent, one reply posted. After each unit:

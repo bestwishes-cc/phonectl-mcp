@@ -218,3 +218,48 @@ def test_a_record_file_that_is_not_ours_is_reported(home, content):
     st.STATE.write_text(content)
     with pytest.raises(st.SetupError):
         st.stale()
+
+
+def test_claude_code_gets_end_of_turn_hooks_next_to_the_users_own(home, monkeypatch):
+    import json
+    from pathlib import Path
+
+    settings = home / "settings.json"
+    monkeypatch.setattr(st, "CLAUDE_SETTINGS", settings)
+    theirs = {"hooks": [{"type": "command", "command": "their-hook.sh", "timeout": 5}]}
+    settings.write_text(json.dumps({"env": {"A": "1"}, "hooks": {"Stop": [theirs], "PreToolUse": [theirs]}}))
+    cmd = st._hook_command(URL, Path("/tok"))
+    st._claude_hook(cmd, [])
+    st._claude_hook(cmd, [])  # phonectl update: still one of ours
+    data = json.loads(settings.read_text())
+    assert data["env"] == {"A": "1"} and data["hooks"]["PreToolUse"] == [theirs]
+    for event in ("Stop", "SubagentStop"):
+        ours = [h for g in data["hooks"][event] for h in g["hooks"] if "/phonectl/done" in h["command"]]
+        assert len(ours) == 1 and "/tok" in ours[0]["command"] and "Bearer tok" not in ours[0]["command"]
+    assert theirs in data["hooks"]["Stop"]
+    st._claude_unhook_file([])
+    data = json.loads(settings.read_text())
+    assert data["hooks"] == {"Stop": [theirs], "PreToolUse": [theirs]}
+
+
+def test_gemini_gets_a_named_stop_hook(home, monkeypatch):
+    import json
+    from pathlib import Path
+
+    hooks = home / "hooks.json"
+    monkeypatch.setattr(st, "AGY_HOOKS", hooks)
+    hooks.write_text(json.dumps({"lint": {"PostToolUse": []}}))
+    st._agy_hook(st._hook_command(URL, Path("/tok")), [])
+    data = json.loads(hooks.read_text())
+    assert "/phonectl/done" in data["phonectl-release"]["Stop"][0]["command"] and "lint" in data
+    st._agy_unhook([])
+    assert json.loads(hooks.read_text()) == {"lint": {"PostToolUse": []}}
+
+
+def test_the_hook_command_never_breaks_the_agents_turn():
+    import subprocess
+    from pathlib import Path
+
+    cmd = st._hook_command("http://127.0.0.1:9/mcp", Path("/nonexistent/token"))
+    r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=10)
+    assert r.returncode == 0 and r.stdout.strip() == "{}"  # never blocks or breaks the agent's turn

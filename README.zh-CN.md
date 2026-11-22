@@ -62,7 +62,7 @@ phonectl doctor            # 检查数据线、信任、开发者模式、磁盘
 phonectl setup claude-code        # 或者：codex、gemini（桌面版）、deepseek-harness
 ```
 
-`setup` 会把服务连同令牌加进这个 Agent 的 MCP 配置，并装上 `phonectl-scripts` skill，里面是和别的 Agent 共用手机的脚本要守的规矩：排队、在两个工作单元之间让出手机、被打断后能接着做。第一次改动某个文件之前，它会把原文件保存为 `<文件>.phonectl.bak`，改完列出改了什么。只输入 `phonectl setup` 会列出它认识的 Agent；`phonectl setup --remove <agent>` 把两样都撤掉。升级 phonectl 之后，`phonectl update` 会更新所有这样装过的 Agent 里的 skill（`doctor` 会提示哪个落后了）；你手动改过的 skill 不会被覆盖。
+`setup` 会把服务连同令牌加进这个 Agent 的 MCP 配置，装上 `phonectl-scripts` skill（和别的 Agent 共用手机的脚本要守的规矩：排队、在两个工作单元之间让出手机、被打断后能接着做），并给 Claude Code 和 Gemini 装上一个钩子：Agent 这一轮结束时马上交还手机。第一次改动某个文件之前，它会把原文件保存为 `<文件>.phonectl.bak`，改完列出改了什么。只输入 `phonectl setup` 会列出它认识的 Agent；`phonectl setup --remove <agent>` 把这些都撤掉。升级 phonectl 之后，`phonectl update` 会更新所有这样装过的 Agent 里的 skill（`doctor` 会提示哪个落后了）；你手动改过的 skill 不会被覆盖。
 
 **其他客户端手动配置**（`~/.cursor/mcp.json` 等支持 streamable HTTP 的客户端）。这样配置的 Agent 能操作手机，但没有那个 skill：它写的脚本不知道要把手机让给别的 Agent。
 
@@ -102,11 +102,12 @@ phonectl setup claude-code        # 或者：codex、gemini（桌面版）、dee
 
 ## 多个 Agent 共用一台手机
 
-连到服务的客户端共用这台手机，轮流使用：一个客户端开始用手机后，就一直占着，直到它停顿的时间超过它自己最近的节奏（10 到 90 秒）。这期间别的客户端的调用会排队等待，不会落到对方的屏幕上。一次调用最多等 50 秒，比各个 Agent 自己的工具超时都短；等不到就返回 `WAITING`，什么都没做，这个客户端的排队位置保留 2 分钟，再调用一次就从原位接着等。Agent 会把 `WAITING` 当作再调用一次的提示，而不是失败。`status` 会显示谁在用手机、谁在排队。
+连到服务的客户端共用这台手机，轮流使用：一个客户端开始用手机后，就一直占着，直到它停顿的时间超过它本轮最长停顿的 3 倍（15 到 90 秒），或者它这一轮结束（见下）。只看过屏幕、没有操作过的客户端不占着手机，有人排队就马上交出去。这期间别的客户端的调用会排队等待，不会落到对方的屏幕上。一次调用最多等 50 秒，比各个 Agent 自己的工具超时都短；等不到就返回 `WAITING`，什么都没做，这个客户端的排队位置保留 2 分钟，再调用一次就从原位接着等。Agent 会把 `WAITING` 当作再调用一次的提示，而不是失败。`status` 会显示谁在用手机、谁在排队。
 
-- 服务按进程区分客户端：一个 Claude Code 会话和它的子 Agent 算一个客户端。Agent 运行的脚本算作这个 Agent 本人，不用等它，也不会把手机从它手里拿走；从终端直接运行的脚本是一个单独的客户端。一个进程里跑几个互不相干的任务时，每个任务发送请求头 `X-Phonectl-Client: <名字>`。客户端的进程一退出，手机马上空出来。
-- 只有在别人用过手机之后、这个客户端又看过屏幕，它的点按、滑动、打字、按键才会发出。否则这次调用返回错误 `NOT DONE`，什么都不发；先看一眼屏幕，再决定要不要重做。服务启动后每个客户端的第一次这类操作也是如此，因为服务不知道之前谁用过手机。`tap_text`、`launch_app`、`press_button` 不依赖旧坐标，总是照常执行。
+- 服务按进程区分客户端：一个 Claude Code 会话和它的子 Agent 算一个客户端。Agent 运行的脚本算作这个 Agent 本人，不用等它，也不会把手机从它手里拿走；从终端直接运行的脚本是一个单独的客户端。一个进程里跑几个互不相干的任务时，每个任务发送请求头 `X-Phonectl-Client: <名字>`。客户端的进程一退出，手机马上空出来，起了名字的客户端也一样。
+- 只有在别人改变过屏幕之后、发出操作的这个进程又看过屏幕，它的点按、滑动、打字、按键才会发出（这里 Agent 运行的脚本算单独的进程：脚本看了屏幕不等于 Agent 看过，脚本的点按也会让 Agent 需要重新看）。否则这次调用返回错误 `NOT DONE`，什么都不发；先看一眼屏幕，再决定要不要重做。服务启动后每个进程的第一次这类操作也是如此，因为服务不知道之前谁用过手机。`tap_text` 也守这条规矩，因为它找到的文字可能在别人的 App 里；但如果调用方之后自己用 `launch_app` 打开过它的 App，就照常执行。`launch_app`、`press_button` 不依赖旧坐标，总是照常执行。
 - 长时间运行的脚本，在两个工作单元之间调用 `POST /phonectl/yield`（同一个令牌）让出手机：只有在有人排队时才交出去。不让出的话，别人要等它停顿，最长等 30 分钟。
+- Agent 这一轮结束时，它的钩子可以调用 `POST /phonectl/done` 告诉服务，手机马上空出来，不用等它停顿；`phonectl setup` 会给 Claude Code 和 Gemini 装上这个钩子。
 - 服务看不到你本人在用手机：`phonectl hold 30m` 让各个 Agent 让开，`phonectl hold off` 结束。
 
 ## 脚本
@@ -180,7 +181,7 @@ print(asyncio.run(main()))
 | `PHONECTL_TOUCH_IDLE` | `30` | 空闲几秒后关闭输入通道（重开约 0.6 秒） |
 | `PHONECTL_KEY_IDLE` | `5` | 几秒没按键后断开虚拟键盘，屏幕键盘随之回来 |
 | `PHONECTL_CALL_TIMEOUT` | `15` | 等手机响应几秒算失败（不含手势耗时） |
-| `PHONECTL_IDLE` | `90` | 客户端停顿多久一定算用完了手机；节奏快的客户端按它自己的节奏判断，最短 10 秒 |
+| `PHONECTL_IDLE` | `90` | 客户端停顿多久一定算用完了手机；节奏快的客户端按它自己的节奏判断，最短 15 秒 |
 | `PHONECTL_WAIT` | `50` | 调用最多排队等几秒，之后返回 `WAITING`；要短于各客户端自己的工具超时 |
 | `PHONECTL_MAX_HOLD` | `1800` | 一个客户端连续占用这么久以后，让排队的客户端先用 |
 | `PHONECTL_LOG` | `WARNING` | 日志级别（服务为 `INFO`，会记下每次调用来自哪个客户端），日志在 `~/Library/Logs/phonectl*.log`；一个日志超过 10 MB 时，旧内容移到 `<文件名>.1`，替换更早的那份 |

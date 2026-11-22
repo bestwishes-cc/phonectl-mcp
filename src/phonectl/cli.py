@@ -404,10 +404,10 @@ def hold(args) -> int:
 
 
 def _connection():
-    """The URL and token the service uses."""
+    """The URL, token and token file the service uses."""
     _use_service_env()
     srv = _server_settings()
-    return f"http://{srv.HTTP_HOST}:{srv.HTTP_PORT}/mcp", srv._load_token(srv.TOKEN_PATH)
+    return f"http://{srv.HTTP_HOST}:{srv.HTTP_PORT}/mcp", srv._load_token(srv.TOKEN_PATH), srv.TOKEN_PATH
 
 
 def setup_agents(args) -> int:
@@ -432,11 +432,11 @@ def _setup_agents(st, args) -> int:
     if unknown:
         print(f"Unknown agent: {', '.join(unknown)}. Known: {', '.join(st.AGENTS)}")
         return 1
-    url, token = _connection()
+    url, token, token_path = _connection()
     failed = False
     for name in args.agents:
         try:
-            lines = st.uninstall(name) if args.remove else st.install(name, url, token, args.force)
+            lines = st.uninstall(name) if args.remove else st.install(name, url, token, args.force, token_path)
         except (st.SetupError, OSError, ValueError) as e:
             lines, failed = [f"{st.AGENTS[name].title}: not done: {e}"], True
         print("\n".join(lines))
