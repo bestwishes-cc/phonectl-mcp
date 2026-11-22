@@ -136,36 +136,6 @@ def test_an_abandoned_wait_ends_without_the_phone_and_leaves_the_line():
     assert "waiting" not in run(main())
 
 
-def test_the_holder_is_judged_by_its_own_pace():
-    # A quick holder that has stopped is done long before the slowest pace's grace runs out.
-    async def main():
-        arb = Arbiter(idle_s=10, wait_s=10, grace_min_s=0.05, grace_start_s=10)
-        a, b = arb.client("a", "A"), arb.client("b", "B")
-        for _ in range(5):
-            await call(arb, a)
-            await asyncio.sleep(0.03)
-        assert arb.grace() < 0.5
-        t0 = time.monotonic()
-        await call(arb, b)
-        return time.monotonic() - t0
-
-    assert run(main()) < 1.0
-
-
-def test_a_new_holder_starts_from_the_default_grace():
-    async def main():
-        arb = Arbiter(idle_s=10, wait_s=10, grace_min_s=0.05, grace_start_s=3)
-        a, b = arb.client("a", "A"), arb.client("b", "B")
-        for _ in range(4):
-            await call(arb, a)
-            await asyncio.sleep(0.02)
-        assert await arb.release(a)
-        await call(arb, b)  # b's pace is not a's
-        return arb.grace()
-
-    assert run(main()) == 3
-
-
 def test_yield_gives_the_phone_up_only_to_someone_waiting():
     async def main():
         arb = Arbiter(idle_s=0.3, wait_s=5)
@@ -465,32 +435,6 @@ def test_a_client_calling_again_is_not_overtaken_in_the_gap():
     assert run(main()) == ["b", "c"]
 
 
-def test_the_grace_is_three_times_the_longest_pause():
-    async def main():
-        arb = Arbiter(idle_s=10, wait_s=5, grace_min_s=0.01, grace_start_s=5)
-        a = arb.client("a", "A")
-        await call(arb, a)
-        assert arb.grace() == 5  # no pause yet
-        for pause in (0.05, 0.15, 0.05):
-            await asyncio.sleep(pause)
-            await call(arb, a)
-        return arb.grace()
-
-    assert 0.44 < run(main()) < 0.6  # 3 x 0.15, not shrunk by the quick ones
-
-
-def test_a_holder_that_only_looked_keeps_the_phone_only_for_the_shortest_grace():
-    async def main():
-        arb = Arbiter(idle_s=10, wait_s=5, grace_min_s=0.2, grace_start_s=5)
-        a, b = arb.client("a", "A"), arb.client("b", "B")
-        await call(arb, a, acts=False)
-        t0 = time.monotonic()
-        await call(arb, b)
-        return time.monotonic() - t0
-
-    assert 0.15 < run(main()) < 0.6  # the shortest grace, not the 5 s before a first pause
-
-
 def test_looking_does_not_make_anyone_look_again():
     async def main():
         arb = Arbiter(idle_s=0.01, wait_s=5)
@@ -578,20 +522,6 @@ def test_a_refused_call_changes_nothing():
     assert run(main()) is None
 
 
-def test_a_holder_that_only_looked_yields_to_the_line_not_to_a_newcomer():
-    async def main():
-        arb = Arbiter(idle_s=10, wait_s=5)
-        a, b = arb.client("a", "A"), arb.client("b", "B")
-        arb.saw_screen(await call(arb, b, acts=False))  # b only looked, and thinks
-        t0 = time.monotonic()
-        with pytest.raises(StillWaiting):
-            arb.wait_s = 0.2
-            await call(arb, a)  # a newcomer does not take it at once...
-        return time.monotonic() - t0
-
-    assert run(main()) >= 0.2
-
-
 def test_the_end_of_turn_hook_does_not_free_a_phone_a_running_script_is_using():
     async def main():
         import os
@@ -644,3 +574,23 @@ def test_waiters_behind_a_retry_window_do_not_poll():
         return wakes
 
     assert run(main()) < 10
+
+
+def test_a_holder_keeps_the_phone_through_long_pauses_until_its_idle_time():
+    # A pause says nothing about whether a task is over: only the fixed idle time does.
+    async def main():
+        arb = Arbiter(idle_s=0.6, wait_s=5)
+        a, b = arb.client("a", "A"), arb.client("b", "B")
+        for pause in (0.01, 0.01, 0.4):  # quick steps, then a long thought
+            await call(arb, a)
+            await asyncio.sleep(pause)
+        waiting = asyncio.create_task(call(arb, b))
+        await asyncio.sleep(0.05)
+        assert not waiting.done()  # 0.45 s after a's last call: still a's
+        await call(arb, a)  # a goes on with its task
+        t0 = time.monotonic()
+        await waiting
+        return time.monotonic() - t0
+
+    assert 0.5 < run(main()) < 1.0  # b gets it only after a full idle time
+

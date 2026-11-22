@@ -1,8 +1,12 @@
 """Who may use the phone right now, when several clients share one server.
 
 The phone has one screen, so two agents driving it at once take turns call by call and act on
-each other's screens. Here a client that starts using the phone holds it until it pauses for
-longer than its own pace says it is still working (see grace()); a call from anyone else
+each other's screens. Here a client that starts using the phone holds it for its whole task,
+until it says it is done: an agent's end-of-turn hook (done), a script yielding between two
+units of work (yield_to_waiter), its process exiting, or a release. The server does not guess
+where a task ends from the pauses between calls: an agent thinks between steps for a few
+seconds or a minute, which looks the same as having finished. Only a holder that made no call
+for IDLE_S while someone waits is taken to have forgotten to say so. A call from anyone else
 meanwhile waits in line instead of landing on the holder's screen. A wait lasts at most WAIT_S,
 below every client's own tool-call timeout; then the call ends with StillWaiting, having done
 nothing, and the client keeps its place in line for KEEP_PLACE_S so that calling again carries
@@ -38,12 +42,11 @@ from typing import AsyncIterator, Callable, Optional
 
 log = logging.getLogger(__name__)
 
-# A holder that paused this long has finished with the phone, whatever its pace: the most
-# grace() gives. A holder's pause is judged by its own pace (see grace()), between GRACE_MIN_S
-# and this; GRACE_START_S before its first pause.
+# A holder that made no call for this long, while someone waits, has finished without saying
+# so (an agent without an end-of-turn hook, or one whose hook did not get through). Longer than
+# an agent's thinking between two steps; a holder that pauses longer mid-task (to write a draft,
+# say) loses the phone, and gets back in line on its next call.
 IDLE_S = float(os.environ.get("PHONECTL_IDLE", "90"))
-GRACE_MIN_S = 15.0
-GRACE_START_S = 60.0
 # A place whose call has just run out of waiting still holds the line this long: the client is
 # calling again (a model step, a few seconds), and the phone must not go to someone behind it
 # in that gap.
@@ -143,10 +146,9 @@ def _alive(pid: int) -> bool:
 class Arbiter:
     def __init__(self, idle_s: float = IDLE_S, wait_s: float = WAIT_S, max_hold_s: float = MAX_HOLD_S,
                  clock: Callable[[], float] = time.monotonic, keep_place_s: float = KEEP_PLACE_S,
-                 grace_min_s: float = GRACE_MIN_S, grace_start_s: float = GRACE_START_S,
                  retry_hold_s: float = RETRY_HOLD_S, sharing: bool = True):
         self.idle_s, self.wait_s, self.max_hold_s = idle_s, wait_s, max_hold_s
-        self.keep_place_s, self.grace_min_s, self.grace_start_s = keep_place_s, grace_min_s, grace_start_s
+        self.keep_place_s = keep_place_s
         self.retry_hold_s = retry_hold_s
         # False only to measure what sharing prevents (PHONECTL_SHARING=off, for benchmarks):
         # every call goes ahead at once, as before this module existed; blind inputs on a
@@ -166,11 +168,6 @@ class Arbiter:
         self._views: dict[tuple[str, int], _View] = {}  # (client key, pid or 0) -> what it saw
         self._version = 0  # how many times the screen was changed
         self._last_changer: Optional[str] = None  # the key of the client that changed it last
-        # The longest pause between the holder's calls in its current stretch of use.
-        self._longest: Optional[float] = None
-        # Whether the holder changed the screen in its current stretch. One that only looked has
-        # nothing on the screen to lose: it gets the shortest grace (see grace()).
-        self._acted = False
 
     def assume_used_before(self) -> None:
         """The phone may have been used before this server started (a restart): every client's
@@ -237,26 +234,12 @@ class Arbiter:
     # --- pace ---------------------------------------------------------------------------
 
     def grace(self) -> float:
-        """How long the holder may pause before it counts as done with the phone: three times
-        its longest pause in this stretch of use, kept within grace_min_s..idle_s; grace_start_s
-        before its first pause. Its pace in this stretch is what counts, not the client's habits:
-        the same agent thinks longer on one task than another. The longest pause, not an average:
-        a run of quick steps must not shrink the grace below the occasional long thought, or the
-        phone is taken from an agent in the middle of its task."""
-        if not self._acted:
-            # It has only looked: nothing of its is on the screen to lose, so the shortest grace.
-            # Not none at all: then a newcomer could take the phone from every waiter that got
-            # its turn and is still looking, and two waiters that only look would trade it.
-            return min(self.idle_s, self.grace_min_s)
-        estimate = self.grace_start_s if self._longest is None else 3 * self._longest
-        return min(self.idle_s, max(self.grace_min_s, estimate))
-
-    def _note_pause(self, pause: float) -> None:
-        self._longest = pause if self._longest is None else max(self._longest, pause)
+        """How long a holder may make no call before it counts as done while someone waits.
+        Fixed: a pause tells nothing about whether a task is over (see the module notes)."""
+        return self.idle_s
 
     def _new_stretch(self, now: float) -> None:
         self._held_since = now
-        self._longest = None
 
     # --- use ----------------------------------------------------------------------------
 
@@ -287,15 +270,12 @@ class Arbiter:
 
     def acting(self, lease: Lease) -> None:
         """The call is about to change the screen (it passed its checks; a refused call changes
-        nothing): every other process has to look again, and the holder now has something on
-        the screen to keep."""
+        nothing): every other process has to look again."""
         self._changed(lease.client, lease.view)
         if lease.stale_by is None:
             # It acted on a screen it had seen: the client knows what is there now, so a new
             # process of it (the next run of a per-call tool) starts fresh after this.
             lease.client.looked_at = self._version
-        if self._holder is lease.client:
-            self._acted = True
 
     def saw_screen(self, lease: Lease) -> None:
         """The call looked at the screen: the process's coordinates are current, unless the
@@ -432,17 +412,11 @@ class Arbiter:
                 log.info("phone taken by %s", client.label)
             self._holder = client
             self._new_stretch(now)
-            self._acted = False
             # Its turn has come: places it kept from earlier calls are used up, or it could go
             # ahead of the line again right after giving the phone up.
             self._queue = [p for p in self._queue if not (p.client is client and p.away_until is not None)]
-        elif not self._active:
-            pause = now - self._last_end
-            if pause >= self.grace():
-                self._new_stretch(now)  # back after a break: a new stretch of use, not one long hold
-                self._acted = False
-            else:
-                self._note_pause(pause)
+        elif not self._active and now - self._last_end >= self.grace():
+            self._new_stretch(now)  # back after a break: a new stretch of use, not one long hold
         self._active += 1
         client.seen = now
 
