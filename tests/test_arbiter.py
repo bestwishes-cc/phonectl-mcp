@@ -613,3 +613,13 @@ def test_a_pause_longer_than_the_steps_before_it_does_not_end_the_holders_task()
     return_after_idle = arb._may_take(b, True)
     assert (after_a_thought, return_after_idle) == (False, True)
 
+
+def test_status_shows_the_phone_free_once_its_holders_process_has_exited():
+    async def main():
+        arb = Arbiter(idle_s=90, wait_s=5)
+        gone = arb.client("pid:999999", "a script", 999999)  # no such process
+        await call(arb, gone)
+        return arb.describe()
+
+    assert run(main()) == "free"
+

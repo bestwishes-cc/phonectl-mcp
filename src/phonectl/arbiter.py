@@ -495,7 +495,7 @@ class Arbiter:
             return f"held for the person using it for another {self._person_until - now:.0f} s (phonectl hold)"
         h = self._holder
         grace = self.grace()
-        if h is None or (not self._active and now - self._last_end >= grace):
+        if h is None or (not self._active and (now - self._last_end >= grace or self._holder_exited())):
             line = "free"
         else:
             who = "you" if viewer is h else h.label
