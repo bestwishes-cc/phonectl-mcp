@@ -599,9 +599,48 @@ def test_the_end_of_turn_hook_does_not_free_a_phone_a_running_script_is_using():
         agent = arb.client("pid:1", "agent", 1)
         async with arb.use(agent, pid=os.getpid()) as lease:  # a script of the agent, still running
             arb.acting(lease)
+        async with arb.use(agent, pid=1) as lease:  # the agent itself looks last
+            arb.saw_screen(lease)
         kept = not await arb.done(agent)
-        async with arb.use(agent, pid=1) as lease:  # the agent itself
-            arb.acting(lease)
+        arb._views.pop(("pid:1", os.getpid()))  # the script has exited
         return kept, await arb.done(agent)
 
     assert run(main()) == (True, True)
+
+
+def test_a_per_call_tool_can_tap_then_type_without_looking_in_between():
+    async def main():
+        arb = Arbiter(idle_s=10, wait_s=5)
+        a = arb.client("a", "A")
+        async with arb.use(a, pid=11) as lease:
+            arb.saw_screen(lease)  # run 1: screenshot
+        async with arb.use(a, pid=12) as lease:
+            first = lease.stale_by
+            arb.acting(lease)  # run 2: tap the field
+        async with arb.use(a, pid=13) as lease:
+            return first, lease.stale_by  # run 3: type
+
+    assert run(main()) == (None, None)
+
+
+def test_waiters_behind_a_retry_window_do_not_poll():
+    async def main():
+        arb = Arbiter(idle_s=10, wait_s=0.1, keep_place_s=5, retry_hold_s=0.5)
+        a, b, c = (arb.client(k, k.upper()) for k in "abc")
+        await call(arb, a)
+        with pytest.raises(StillWaiting):
+            await call(arb, b)  # b's place holds the line for 0.5 s
+        arb.wait_s = 5
+        assert await arb.release(a)
+        wakes = 0
+        real = arb._may_take
+
+        def counted(*args):
+            nonlocal wakes
+            wakes += 1
+            return real(*args)
+        arb._may_take = counted
+        await call(arb, c)
+        return wakes
+
+    assert run(main()) < 10

@@ -89,7 +89,6 @@ class Client:
     # The screen version (Arbiter._version) any of its processes last looked at: what a new
     # process of it starts from (a tool run once per call is a new process every time).
     looked_at: Optional[int] = None
-    last_pid: Optional[int] = None  # the process of its latest call
 
 
 @dataclass(eq=False)
@@ -190,6 +189,9 @@ class Arbiter:
             # A new process starts from what its client last saw: fresh if one of the client's
             # processes has looked since the screen last changed (a tool that runs once per call
             # looks in one process and taps in the next), else it has not seen what changed.
+            # Known gap: the server cannot tell which process's output the agent read, so a new
+            # process is let through even when the agent's coordinates came from an older look
+            # by another of its processes.
             fresh = client.looked_at is not None and client.looked_at == self._version
             stale = None if fresh or self._last_user is None else \
                 self._by(self._last_user, self._last_changer, client.key)
@@ -267,7 +269,6 @@ class Arbiter:
         change the screen says so with acting(), once it has passed its checks."""
         await self._acquire(client, abandoned)
         view = self._view(client, pid)
-        client.last_pid = pid
         lease = Lease(client, view, view.stale_by, view.changes, view.relaunched)
         try:
             yield lease
@@ -289,6 +290,10 @@ class Arbiter:
         nothing): every other process has to look again, and the holder now has something on
         the screen to keep."""
         self._changed(lease.client, lease.view)
+        if lease.stale_by is None:
+            # It acted on a screen it had seen: the client knows what is there now, so a new
+            # process of it (the next run of a per-call tool) starts fresh after this.
+            lease.client.looked_at = self._version
         if self._holder is lease.client:
             self._acted = True
 
@@ -367,7 +372,7 @@ class Arbiter:
                     # Wake for a release, a call ending, the holder's pause running out, or a
                     # place ahead no longer holding the line. A phone free now but not to this
                     # call is held by such a place: its window's end is the next chance.
-                    free = self._free_at()
+                    free = self._free_at(now)
                     if free <= now:
                         free = self._window_ends(now)
                     wake = min(deadline, free, self._window_ends(now))
@@ -404,17 +409,18 @@ class Arbiter:
         h = self._holder
         return h is not None and h.pid is not None and not _alive(h.pid)
 
-    def _free_at(self) -> float:
+    def _free_at(self, now: Optional[float] = None) -> float:
         """Earliest time the phone may change hands without anyone releasing it."""
-        if self._clock() < self._person_until:
+        now = self._clock() if now is None else now
+        if now < self._person_until:
             return self._person_until
         if self._holder is None:
-            return self._clock()
+            return now
         if self._active:
             return float("inf")
         free = min(self._last_end + self.grace(), self._held_since + self.max_hold_s)
         if self._holder.pid is not None:
-            free = min(free, self._clock() + _EXIT_POLL_S)  # look again whether it has exited
+            free = min(free, now + _EXIT_POLL_S)  # look again whether it has exited
         return free
 
     def _take(self, client: Client) -> None:
@@ -457,12 +463,12 @@ class Arbiter:
             return True
 
     async def done(self, client: Client) -> bool:
-        """The client's turn ended (its end-of-turn hook): give the phone up, unless its latest
-        call came from another process of it that is still running (a script it left working
-        in the background)."""
-        last = client.last_pid
-        if last is not None and last != client.pid and _alive(last):
-            return False
+        """The client's turn ended (its end-of-turn hook): give the phone up, unless another
+        process of it that has used the phone is still running (a script it left working in
+        the background). Then the phone goes by the client's pace as usual."""
+        for key, pid in self._views:
+            if key == client.key and pid and pid != client.pid and _alive(pid):
+                return False
         return await self.release(client)
 
     async def yield_to_waiter(self, client: Client) -> bool:
