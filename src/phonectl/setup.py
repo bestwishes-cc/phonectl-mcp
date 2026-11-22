@@ -2,7 +2,7 @@
 
 Each agent keeps its MCP servers and its skills in its own place, in its own format; this module
 knows those places for the agents below and writes them the agent's way (its own command where
-it has one). Every file it changes is backed up as <file>.bak first. What it installed is
+it has one). The first time it changes a file, it keeps the original as <file>.bak. What it installed is
 recorded in STATE, so `phonectl update` can bring the skill up to date after an upgrade, and a
 skill the user edited since is left as it is.
 """
@@ -43,8 +43,11 @@ def _run(*cmd: str) -> str:
 
 
 def _backup(path: Path, changed: list[str]) -> None:
-    if path.exists():
-        shutil.copy2(path, path.with_name(path.name + ".bak"))
+    """Keep the file as it was before phonectl first changed it, as <file>.bak. A later run
+    does not overwrite that copy: it would replace the user's original with phonectl's edit."""
+    bak = path.with_name(path.name + ".bak")
+    if path.exists() and not bak.exists():
+        shutil.copy2(path, bak)
     changed.append(str(path))
 
 
@@ -96,17 +99,23 @@ def _claude_remove(changed: list[str]) -> None:
 # which an app started from the Dock does not have, so the table is written here.
 
 CODEX_TOML = HOME / ".codex" / "config.toml"
-_TABLE = re.compile(rf"^\[mcp_servers\.{NAME}(\..*)?\]\s*$")
+_TABLE = re.compile(rf"^\[mcp_servers\.{NAME}(\.[^\]]*)?\]\s*(#.*)?$")
 
 
 def _codex_without_phone(text: str) -> str:
-    """config.toml with the [mcp_servers.phone] table (and its subtables) taken out."""
-    out, skipping = [], False
+    """config.toml with the [mcp_servers.phone] table (and its subtables) taken out. Comments
+    just above the next table belong to that table and stay."""
+    out, skipped, skipping = [], [], False
     for line in text.splitlines(keepends=True):
         if line.lstrip().startswith("["):
+            if skipping:  # give the comments right above this header back to it
+                tail = len(skipped)
+                while tail and (not skipped[tail - 1].strip() or skipped[tail - 1].lstrip().startswith("#")):
+                    tail -= 1
+                out += skipped[tail:]
+                skipped = []
             skipping = bool(_TABLE.match(line.strip()))
-        if not skipping:
-            out.append(line)
+        (skipped if skipping else out).append(line)
     return "".join(out).rstrip("\n") + ("\n" if out else "")
 
 
@@ -156,47 +165,95 @@ def _agy_remove(changed: list[str]) -> None:
 # command for this; it reloads the file when it changes.
 
 DSH_PATCH = HOME / ".dsh" / "profiles" / "desktop" / "cordis.patch.yml"
+_MARK = "# phonectl setup: the shared phone server."
 
 
-def _dsh_entry(url: str, token: str) -> list[str]:
-    return ["      # phonectl setup: the shared phone server.\n",
-            f"      {NAME}:\n",
-            "        transport: streamable-http\n",
-            f"        url: {url}\n",
-            "        headers:\n",
-            f"          Authorization: {json.dumps('Bearer ' + token)}\n"]
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
 
 
-def _dsh_split(lines: list[str]) -> tuple[int, int, int]:
-    """(start of the mcp-manager item, its servers: line, end of the item), -1 where absent."""
-    start = next((i for i, l in enumerate(lines) if re.match(r"^- id:\s*mcp-manager\s*$", l)), -1)
-    if start < 0:
-        return -1, -1, len(lines)
-    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("- ")), len(lines))
-    servers = next((i for i in range(start, end) if re.match(r"^    servers:\s*$", lines[i])), -1)
-    return start, servers, end
+def _content(line: str) -> bool:
+    """Not blank and not a comment."""
+    return bool(line.strip()) and not line.lstrip().startswith("#")
 
 
-def _dsh_without_phone(lines: list[str]) -> list[str]:
-    start, servers, end = _dsh_split(lines)
-    if servers < 0:
-        return lines
-    out, i = lines[:servers + 1], servers + 1
-    while i < end:
-        line = lines[i]
-        if re.match(rf"^      {NAME}:\s*$", line):
-            while out and out[-1].strip().startswith("#") and out[-1].startswith("      #"):
-                out.pop()  # the comment that belongs to the entry
-            i += 1
-            while i < end and (lines[i].startswith("        ") or not lines[i].strip()):
-                i += 1
-            continue
-        out.append(line)
-        i += 1
-    return out + lines[end:]
+@dataclass
+class _DshLayout:
+    """Where the phone entry goes in the patch file; -1 where a part is missing."""
+    item: int = -1  # the `- id: mcp-manager` line
+    end: int = 0  # the line after the item
+    config: int = -1
+    servers: int = -1
+    child: int = -1  # indentation of the entries under servers
+    phone: int = -1  # the `phone:` line
+    phone_end: int = -1  # the line after the phone entry
+
+
+def _dsh_layout(lines: list[str]) -> _DshLayout:
+    """Read the parts of the file this module edits. Anything written in a way it does not
+    expect (a flow mapping, an inline value, two mcp-manager items) raises SetupError: an
+    edit by guesswork could merge the user's servers into ours or drop them."""
+    lay = _DshLayout(end=len(lines))
+    items = [i for i, l in enumerate(lines) if re.match(r"^- id:\s*mcp-manager\s*(#.*)?$", l)]
+    if len(items) > 1:
+        raise SetupError(f"{DSH_PATCH} has {len(items)} mcp-manager entries; merge them by hand first")
+    if not items:
+        if any(re.match(r"^-.*\bmcp-manager\b", l) for l in lines):
+            raise SetupError(f"{DSH_PATCH}: the mcp-manager entry is written in a form phonectl does not edit")
+        return lay
+    lay.item = items[0]
+    lay.end = next((i for i in range(lay.item + 1, len(lines)) if _content(lines[i]) and _indent(lines[i]) == 0),
+                   len(lines))
+
+    def key(name: str, start: int, stop: int, deeper_than: int) -> int:
+        for i in range(start, stop):
+            if re.match(rf"^\s+{name}:", lines[i]) and _indent(lines[i]) > deeper_than:
+                if not re.match(rf"^\s+{name}:\s*(#.*)?$", lines[i]):
+                    raise SetupError(f"{DSH_PATCH} line {i + 1}: `{name}:` has an inline value; "
+                                     "phonectl only edits the block form")
+                return i
+        return -1
+
+    lay.config = key("config", lay.item + 1, lay.end, 0)
+    if lay.config < 0:
+        return lay
+    lay.servers = key("servers", lay.config + 1, lay.end, _indent(lines[lay.config]))
+    if lay.servers < 0:
+        return lay
+    top = _indent(lines[lay.servers])
+    block_end = next((i for i in range(lay.servers + 1, lay.end)
+                      if _content(lines[i]) and _indent(lines[i]) <= top), lay.end)
+    entries = [i for i in range(lay.servers + 1, block_end) if _content(lines[i])]
+    lay.child = _indent(lines[entries[0]]) if entries else top + 2
+    for i in entries:
+        if _indent(lines[i]) == lay.child and re.match(rf"^\s+{NAME}:", lines[i]):
+            if not re.match(rf"^\s+{NAME}:\s*(#.*)?$", lines[i]):
+                raise SetupError(f"{DSH_PATCH} line {i + 1}: `{NAME}:` has an inline value; edit it by hand")
+            lay.phone = i
+            lay.phone_end = next((j for j in range(i + 1, block_end)
+                                  if _content(lines[j]) and _indent(lines[j]) <= lay.child), block_end)
+            while lay.phone_end > i + 1 and not lines[lay.phone_end - 1].strip():
+                lay.phone_end -= 1  # blank lines after the entry belong to the file, not to it
+    return lay
+
+
+def _dsh_entry(indent: int, url: str, token: str) -> list[str]:
+    pad = " " * indent
+    return [f"{pad}{NAME}:\n", f"{pad}  transport: streamable-http\n", f"{pad}  url: {url}\n",
+            f"{pad}  headers:\n", f"{pad}    Authorization: {json.dumps('Bearer ' + token)}\n"]
+
+
+def _dsh_read() -> list[str]:
+    lines = DSH_PATCH.read_text().splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    return lines
 
 
 def _dsh_write(lines: list[str], changed: list[str]) -> None:
+    lay = _dsh_layout(lines)  # never leave a file this module could not read back
+    if lay.phone >= 0 and sum(1 for l in lines[lay.servers:lay.end] if re.match(rf"^\s+{NAME}:", l)) != 1:
+        raise SetupError(f"{DSH_PATCH}: the edit would leave more than one `{NAME}` entry; nothing written")
     _backup(DSH_PATCH, changed)
     DSH_PATCH.write_text("".join(lines))
 
@@ -204,27 +261,36 @@ def _dsh_write(lines: list[str], changed: list[str]) -> None:
 def _dsh_add(url: str, token: str, changed: list[str]) -> None:
     if not DSH_PATCH.exists():
         raise SetupError(f"{DSH_PATCH} not found: start DeepSeek Harness once first")
-    lines = _dsh_without_phone(DSH_PATCH.read_text().splitlines(keepends=True))
-    if lines and not lines[-1].endswith("\n"):
-        lines[-1] += "\n"
-    start, servers, end = _dsh_split(lines)
-    entry = _dsh_entry(url, token)
-    if start < 0:
-        lines += ["- id: mcp-manager\n", "  config:\n", "    servers:\n", *entry]
-    elif servers < 0:
-        config = next((i for i in range(start, end) if re.match(r"^  config:\s*$", lines[i])), -1)
-        if config < 0:
-            lines[start + 1:start + 1] = ["  config:\n", "    servers:\n", *entry]
-        else:
-            lines[config + 1:config + 1] = ["    servers:\n", *entry]
+    lines = _dsh_read()
+    lay = _dsh_layout(lines)
+    if lay.item < 0:
+        lines += ["- id: mcp-manager\n", "  config:\n", "    servers:\n", f"      {_MARK}\n",
+                  *_dsh_entry(6, url, token)]
+    elif lay.config < 0:
+        lines[lay.item + 1:lay.item + 1] = ["  config:\n", "    servers:\n", f"      {_MARK}\n",
+                                            *_dsh_entry(6, url, token)]
+    elif lay.servers < 0:
+        ind = _indent(lines[lay.config]) + 2
+        lines[lay.config + 1:lay.config + 1] = [" " * ind + "servers:\n", " " * (ind + 2) + _MARK + "\n",
+                                                *_dsh_entry(ind + 2, url, token)]
+    elif lay.phone >= 0:
+        lines[lay.phone:lay.phone_end] = _dsh_entry(lay.child, url, token)  # in place, comments kept
     else:
-        lines[servers + 1:servers + 1] = entry
+        lines[lay.servers + 1:lay.servers + 1] = [" " * lay.child + _MARK + "\n",
+                                                  *_dsh_entry(lay.child, url, token)]
     _dsh_write(lines, changed)
 
 
 def _dsh_remove(changed: list[str]) -> None:
-    if DSH_PATCH.exists():
-        _dsh_write(_dsh_without_phone(DSH_PATCH.read_text().splitlines(keepends=True)), changed)
+    if not DSH_PATCH.exists():
+        return
+    lines = _dsh_read()
+    lay = _dsh_layout(lines)
+    if lay.phone < 0:
+        return
+    start = lay.phone - 1 if lay.phone > 0 and lines[lay.phone - 1].strip() == _MARK else lay.phone
+    del lines[start:lay.phone_end]
+    _dsh_write(lines, changed)
 
 
 AGENTS = {a.name: a for a in [
@@ -255,10 +321,14 @@ def _tree_hash(root: Path) -> Optional[str]:
 
 
 def _state() -> dict:
+    if not STATE.exists():
+        return {}
     try:
         return json.loads(STATE.read_text())
-    except (OSError, ValueError):
-        return {}
+    except ValueError:
+        # Not {}: saving over it would forget which skills phonectl installed, and every one
+        # of them would then count as edited by hand and never be updated again.
+        raise SetupError(f"{STATE} is not valid JSON; fix it or delete it (then run setup again)") from None
 
 
 def _save_state(state: dict) -> None:
@@ -299,7 +369,7 @@ def install(name: str, url: str, token: str, force: bool = False) -> list[str]:
     state[name] = {**record, "mcp_url": url}
     _save_state(state)
     return [f"{agent.title}: MCP server '{NAME}' -> {url}; {skill}",
-            *(f"  changed {c} (backup: {c}.bak)" for c in changed),
+            *(f"  changed {c} (original kept as {c}.bak)" for c in changed),
             f"  to use it: {agent.reload}"]
 
 
@@ -319,7 +389,7 @@ def uninstall(name: str) -> list[str]:
         skill = "no skill to remove"
     _save_state(state)
     return [f"{agent.title}: MCP server '{NAME}' removed; {skill}",
-            *(f"  changed {c} (backup: {c}.bak)" for c in changed),
+            *(f"  changed {c} (original kept as {c}.bak)" for c in changed),
             f"  then: {agent.reload}"]
 
 

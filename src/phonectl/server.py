@@ -73,8 +73,18 @@ _clipboard_lock = asyncio.Lock()
 # PHONECTL_SHARING=off is for benchmarks only: it measures what sharing prevents (see Arbiter).
 arbiter = Arbiter(sharing=os.environ.get("PHONECTL_SHARING", "on") != "off")
 # Calls waiting in line, by (client key, request id), so a client that hangs up on one by
-# notifications/cancelled can end the wait (see _cancel_waiting).
-_waiting: dict[tuple[str, str], asyncio.Event] = {}
+# notifications/cancelled can end the wait (see _cancel_waiting). Several calls can share a
+# key: an agent and a script it started are one client, and their sessions number requests
+# each from 1.
+_waiting: dict[tuple[str, str], list[asyncio.Event]] = {}
+
+
+def _unlist(key: tuple[str, str], flag: asyncio.Event) -> None:
+    flags = _waiting.get(key, [])
+    if flag in flags:
+        flags.remove(flag)
+    if not flags:
+        _waiting.pop(key, None)
 # The client of the tool call being served (for status).
 _caller: ContextVar[Client] = ContextVar("phonectl_caller")
 
@@ -135,10 +145,11 @@ def _tool(kind: str):
                     return await fn(*args, **kwargs)
                 log.info("%s: %s", client.label, fn.__name__)
                 key = (client.key, _request_id(ctx))
-                gave_up = _waiting[key] = asyncio.Event()
+                gave_up = asyncio.Event()
+                _waiting.setdefault(key, []).append(gave_up)
                 try:
                     async with arbiter.use(client, gave_up) as lease:
-                        _waiting.pop(key, None)  # it has the phone: a cancel now ends nothing
+                        _unlist(key, gave_up)  # it has the phone: a cancel now ends nothing
                         call = sig.bind(*args, **kwargs)
                         call.apply_defaults()
                         shot = call.arguments.get("screenshot", False)
@@ -154,8 +165,7 @@ def _tool(kind: str):
                             arbiter.saw_screen(lease)
                         return result
                 finally:
-                    if _waiting.get(key) is gave_up:
-                        del _waiting[key]
+                    _unlist(key, gave_up)
             except StillWaiting as w:
                 log.info("%s: %s still waiting (number %d in line)", client.label, fn.__name__, w.position)
                 return _still_waiting(fn.__name__, w)
@@ -581,8 +591,9 @@ async def _cancel_waiting(scope, body: bytes) -> bool:
     Clients on the 2025 wire cancel by posting notifications/cancelled; a stateless server
     drops it (no session to find the request in), and the call would go on waiting and then
     act on the phone after its client stopped waiting for it. The cancel is matched to the
-    same client's waiting call by request id (request ids of two MCP sessions in one process
-    can clash; the worst case is ending the wrong one of that process's waits, never an input).
+    same client's waiting calls by request id. Two sessions of one client (an agent and a
+    script it started) can both have a call with that id waiting: both are ended, since ending
+    one too many only costs that call a retry, while ending too few sends an unwanted input.
     2026-wire clients cancel by closing the response stream, which the SDK handles itself.
     True if body was such a notice (handled here; the SDK would only drop it)."""
     if b"notifications/cancelled" not in body:
@@ -597,8 +608,7 @@ async def _cancel_waiting(scope, body: bytes) -> bool:
     headers = dict(scope["headers"])
     name = headers.get(b"x-phonectl-client", b"").decode() or None
     client, _ = await identify(arbiter, scope.get("client"), name)
-    flag = _waiting.get((client.key, str(rid)))
-    if flag is not None:
+    for flag in list(_waiting.get((client.key, str(rid)), [])):
         log.info("%s cancelled a call waiting in line", client.label)
         await arbiter.abandon(flag)
     return True
@@ -611,9 +621,12 @@ def _serve_http() -> None:
     logtrim.keep_trimmed()  # the service logs every call; launchd's log files would only grow
     from . import setup
 
-    if old := setup.stale():
-        log.warning("the phonectl-scripts skill is older than this version for %s: run `phonectl update`",
-                    ", ".join(old))
+    try:
+        if old := setup.stale():
+            log.warning("the phonectl-scripts skill is older than this version for %s: run `phonectl update`",
+                        ", ".join(old))
+    except setup.SetupError as e:  # a broken record of installs must not keep the server from starting
+        log.warning("%s", e)
 
     hosts = [f"{HTTP_HOST}:{HTTP_PORT}", f"localhost:{HTTP_PORT}"]
     app = mcp.streamable_http_app(

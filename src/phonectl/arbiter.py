@@ -85,7 +85,16 @@ class Client:
     # Label of whoever used the phone after this client last saw the screen; None if nobody.
     disturbed_by: Optional[str] = None
     disturbances: int = 0  # how many times disturbed_by was set
-    # In line but between calls (its last one ran out of waiting): keeps its place until then.
+
+
+@dataclass(eq=False)
+class _Place:
+    """One call's place in line. A client can have several: an agent and a script it started
+    are one client, and both may be waiting."""
+
+    client: Client
+    # None while a call waits in it. Set when that call ran out of waiting: the place is kept
+    # until then for the client's next call.
     away_until: Optional[float] = None
 
 
@@ -128,7 +137,7 @@ class Arbiter:
         self._held_since = 0.0
         self._last_end = 0.0  # when the holder's last call ended
         self._active = 0  # calls of the holder in progress
-        self._queue: list[Client] = []  # waiting, first come first; some may be between calls
+        self._queue: list[_Place] = []  # first come first; some between calls
         self._person_until = 0.0
         # Who used the phone last; a client seen for the first time has not looked since.
         self._last_user: Optional[str] = None
@@ -155,7 +164,8 @@ class Arbiter:
         """The record for this client, made on first sight."""
         now = self._clock()
         for k in [k for k, c in self._clients.items()
-                  if now - c.seen > FORGET_S and c is not self._holder and c not in self._queue]:
+                  if now - c.seen > FORGET_S and c is not self._holder
+                  and not any(p.client is c for p in self._queue)]:
             del self._clients[k]
         c = self._clients.get(key)
         if c is None:
@@ -223,23 +233,22 @@ class Arbiter:
             lease.client.disturbed_by = None
 
     def _drop_expired(self, now: float) -> None:
-        for c in [c for c in self._queue if c.away_until is not None and now >= c.away_until]:
-            self._queue.remove(c)
-            c.away_until = None
-            log.info("%s left the line: it did not call again", c.label)
+        for p in [p for p in self._queue if p.away_until is not None and now >= p.away_until]:
+            self._queue.remove(p)
+            log.info("%s left the line: it did not call again", p.client.label)
 
-    def _first_in_line(self, client: Client) -> bool:
-        """Nobody who is waiting right now is ahead of client. One between calls holds up no one:
-        the phone is not kept idle for it."""
-        for c in self._queue:
-            if c is client:
+    def _first_in_line(self, place: Optional[_Place]) -> bool:
+        """No call that is waiting right now is ahead of this place (None: a call not in line
+        yet). A place between calls holds up no one: the phone is not kept idle for it."""
+        for p in self._queue:
+            if p is place:
                 return True
-            if c.away_until is None:
+            if p.away_until is None:
                 return False
         return True
 
     def _others_wait(self, client: Client) -> bool:
-        return any(c is not client and c.away_until is None for c in self._queue)
+        return any(p.client is not client and p.away_until is None for p in self._queue)
 
     async def _acquire(self, client: Client, abandoned: Optional[asyncio.Event]) -> None:
         async with self._cond:
@@ -248,13 +257,16 @@ class Arbiter:
             if not self.sharing:
                 self._take(client)
                 return
-            back = client in self._queue  # its last call ran out of waiting: same place again
-            client.away_until = None
-            if not back:
-                if self._may_take(client, self._first_in_line(client)):
+            # A call of this client ran out of waiting before: this one takes that place.
+            place = next((p for p in self._queue if p.client is client and p.away_until is not None), None)
+            if place is not None:
+                place.away_until = None
+            else:
+                if self._may_take(client, self._first_in_line(None)):
                     self._take(client)
                     return
-                self._queue.append(client)
+                place = _Place(client)
+                self._queue.append(place)
                 log.info("%s waits for the phone (held by %s)", client.label, self._holder_label())
             deadline = now + self.wait_s
             try:
@@ -262,11 +274,11 @@ class Arbiter:
                     now = self._clock()
                     if abandoned is not None and abandoned.is_set():
                         raise Abandoned("the client gave up on the call while it waited in line")
-                    if self._may_take(client, self._first_in_line(client)):
+                    if self._may_take(client, self._first_in_line(place)):
                         break
                     if now >= deadline:
-                        client.away_until = now + self.keep_place_s
-                        raise StillWaiting(self._wait_detail(), self._queue.index(client) + 1, self.keep_place_s)
+                        place.away_until = now + self.keep_place_s
+                        raise StillWaiting(self._wait_detail(), self._queue.index(place) + 1, self.keep_place_s)
                     # Wake for a release, a call ending, or the holder's pause running out.
                     wake = min(deadline, self._free_at())
                     try:
@@ -275,8 +287,8 @@ class Arbiter:
                     except TimeoutError:
                         pass
             finally:
-                if client.away_until is None:  # got the phone, or gave up: out of the line
-                    self._queue.remove(client)
+                if place.away_until is None:  # got the phone, or gave up: out of the line
+                    self._queue.remove(place)
                 self._cond.notify_all()
             self._take(client)
 
@@ -412,7 +424,7 @@ class Arbiter:
             line = f"in use by {who} ({how})"
         if self._queue:
             line += "; waiting: " + ", ".join(
-                c.label + (" (between calls)" if c.away_until is not None else "") for c in self._queue)
+                p.client.label + (" (between calls)" if p.away_until is not None else "") for p in self._queue)
         return line
 
 

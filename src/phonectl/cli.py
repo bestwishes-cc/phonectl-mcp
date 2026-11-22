@@ -349,9 +349,12 @@ async def _doctor(fix: bool) -> int:
                "Replug the cable, unlock the phone, then `phonectl restart`.")
     from . import setup as st
 
-    if old := st.stale():
-        r.warn(f"the phonectl-scripts skill is older than this version for: {', '.join(old)}",
-               "Run `phonectl update`.")
+    try:
+        if old := st.stale():
+            r.warn(f"the phonectl-scripts skill is older than this version for: {', '.join(old)}",
+                   "Run `phonectl update`.")
+    except st.SetupError as e:
+        r.warn(str(e))
     print("\nAll good." if not r.failed else "\nFix the FAIL lines above, then run `phonectl doctor` again.")
     return 1 if r.failed else 0
 
@@ -410,6 +413,14 @@ def _connection():
 def setup_agents(args) -> int:
     from . import setup as st
 
+    try:
+        return _setup_agents(st, args)
+    except st.SetupError as e:
+        print(e)
+        return 1
+
+
+def _setup_agents(st, args) -> int:
     if not args.agents:
         done = st.installed()
         print("Agents phonectl can set up (phonectl setup <name>):")
@@ -435,7 +446,11 @@ def setup_agents(args) -> int:
 def update(_args) -> int:
     from . import setup as st
 
-    names = st.installed()
+    try:
+        names = st.installed()
+    except st.SetupError as e:
+        print(e)
+        return 1
     if not names:
         print("No agent was set up with `phonectl setup` yet.")
         return 0

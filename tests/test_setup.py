@@ -58,7 +58,7 @@ def test_deepseek_harness_entry_is_replaced_in_place(home):
     st._dsh_add(URL, TOKEN, [])
     text = st.DSH_PATCH.read_text()
     assert text.count("      phone:") == 1 and URL in text and '"Bearer tok"' in text
-    assert "Bearer old" not in text and "The resident phonectl service" not in text
+    assert "Bearer old" not in text and "The resident phonectl service" in text  # replaced in place
     assert "      other:\n        url: http://x\n" in text and text.endswith("    preference: light\n")
     st._dsh_remove([])
     assert "phone:" not in st.DSH_PATCH.read_text() and "other:" in st.DSH_PATCH.read_text()
@@ -110,3 +110,54 @@ def test_a_skill_changed_by_hand_is_left_alone(agent):
     assert skill.exists()  # not removed either
     st.install("fake", URL, TOKEN, force=True)
     assert skill.read_text() != "my own notes\n"
+
+
+def test_deepseek_harness_entries_indented_deeper_are_kept_apart(home):
+    st.DSH_PATCH.parent.mkdir()
+    st.DSH_PATCH.write_text("- id: mcp-manager  # servers\n  config:\n    servers:\n        other:\n"
+                            "          url: http://x\n- id: ui-theme\n")
+    st._dsh_add(URL, TOKEN, [])
+    st._dsh_add(URL, TOKEN, [])  # phonectl update
+    text = st.DSH_PATCH.read_text()
+    assert "        other:\n          url: http://x\n" in text  # still its own entry
+    assert text.count("        phone:\n") == 1 and "        other:" in text
+    assert text.count("- id: mcp-manager") == 1
+    st._dsh_remove([])
+    assert "phone" not in st.DSH_PATCH.read_text() and "other:" in st.DSH_PATCH.read_text()
+
+
+@pytest.mark.parametrize("text", [
+    "- id: mcp-manager\n  config:\n    servers: {}\n",
+    "- id: mcp-manager\n  config: {servers: {}}\n",
+    "- id: mcp-manager\n  config:\n    servers:\n      phone: {url: x}\n",
+    "- id: mcp-manager\n- id: mcp-manager\n",
+])
+def test_deepseek_harness_layouts_it_does_not_know_are_left_untouched(home, text):
+    st.DSH_PATCH.parent.mkdir()
+    st.DSH_PATCH.write_text(text)
+    with pytest.raises(st.SetupError):
+        st._dsh_add(URL, TOKEN, [])
+    assert st.DSH_PATCH.read_text() == text
+
+
+def test_the_first_backup_is_the_original(home):
+    st.DSH_PATCH.parent.mkdir()
+    st.DSH_PATCH.write_text(DSH)
+    st._dsh_add(URL, TOKEN, [])
+    st._dsh_add("http://127.0.0.1:1/other", TOKEN, [])
+    assert (st.DSH_PATCH.parent / "cordis.patch.yml.bak").read_text() == DSH
+
+
+def test_codex_keeps_the_comments_above_the_next_table(home):
+    st.CODEX_TOML.parent.mkdir()
+    st.CODEX_TOML.write_text('[mcp_servers.phone]  # ours\nurl = "old"\n\n# my notes on other\n[mcp_servers.other]\ncommand = "y"\n')
+    st._codex_add(URL, TOKEN, [])
+    text = st.CODEX_TOML.read_text()
+    assert "# my notes on other\n[mcp_servers.other]" in text and "old" not in text
+
+
+def test_a_broken_record_file_is_reported_not_overwritten(home):
+    st.STATE.write_text("{not json")
+    with pytest.raises(st.SetupError):
+        st.installed()
+    assert st.STATE.read_text() == "{not json"

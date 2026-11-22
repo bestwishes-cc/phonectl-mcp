@@ -358,3 +358,42 @@ def test_a_client_seen_first_after_a_restart_must_look_first():
         return (await call(arb, a)).stale_by
 
     assert run(main()) == "someone before this server started"
+
+
+def test_two_calls_of_one_client_wait_side_by_side():
+    # An agent and a script it started are one client; both may wait at once.
+    async def main():
+        arb = Arbiter(idle_s=10, wait_s=5)
+        a, b = arb.client("a", "A"), arb.client("b", "B")
+        await call(arb, a)
+        both = asyncio.gather(call(arb, b), call(arb, b))
+        await asyncio.sleep(0.05)
+        assert arb.describe().endswith("waiting: B, B")
+        assert await arb.release(a)
+        await both  # neither fails
+
+    run(main())
+
+
+def test_one_call_running_out_of_waiting_keeps_the_clients_other_call_in_line():
+    async def main():
+        arb = Arbiter(idle_s=10, wait_s=5, keep_place_s=5)
+        a, b, c = (arb.client(k, k.upper()) for k in "abc")
+        log = []
+        await call(arb, a)
+        arb.wait_s = 0.2
+        short = asyncio.create_task(call(arb, b))
+        await asyncio.sleep(0.02)
+        arb.wait_s = 5
+        long = asyncio.create_task(call(arb, b, 0, log))
+        with pytest.raises(StillWaiting):
+            await short
+        tc = asyncio.create_task(call(arb, c, 0, log))
+        await asyncio.sleep(0.05)
+        assert "B (between calls), B, C" in arb.describe()
+        arb.idle_s = 0.1  # b is quick to be done once it has had its turn
+        assert await arb.release(a)
+        await asyncio.gather(long, tc)
+        return [k for k, _ in log]
+
+    assert run(main()) == ["b", "c"]  # b's waiting call is still ahead of c
