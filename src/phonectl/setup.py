@@ -510,6 +510,11 @@ def _put_skill(agent: Agent, record: dict, force: bool) -> str:
     return f"skill installed in {dest}"
 
 
+def _changed_lines(changed: list[str]) -> list[str]:
+    return [f"  changed {c} (original kept as {c}{BACKUP})" if Path(c + BACKUP).exists()
+            else f"  created {c}" for c in sorted(set(changed))]
+
+
 def install(name: str, url: str, token: str, force: bool = False,
             token_path: Optional[Path] = None) -> list[str]:
     """Connect agent `name`, give it the skill and, where it has hooks, the end-of-turn hook.
@@ -530,7 +535,7 @@ def install(name: str, url: str, token: str, force: bool = False,
     state[name] = {**record, "mcp_url": url}
     _save_state(state)
     return [f"{agent.title}: MCP server '{NAME}' -> {url}; {skill}; {hook}",
-            *(f"  changed {c} (original kept as {c}{BACKUP})" for c in sorted(set(changed))),
+            *_changed_lines(changed),
             f"  to use it: {agent.reload}"]
 
 
@@ -552,7 +557,7 @@ def uninstall(name: str) -> list[str]:
         skill = "no skill to remove"
     _save_state(state)
     return [f"{agent.title}: MCP server '{NAME}' removed; {skill}",
-            *(f"  changed {c} (original kept as {c}{BACKUP})" for c in sorted(set(changed))),
+            *_changed_lines(changed),
             f"  then: {agent.reload}"]
 
 
