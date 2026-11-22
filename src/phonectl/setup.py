@@ -367,21 +367,24 @@ def _write_json(path: Path, data: dict, changed: list[str]) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
-# Claude Code: Stop (its turn ended) in ~/.claude/settings.json, next to whatever hooks are
-# there already. Not SubagentStop: a subagent that finishes (one that read code, say) does not
-# mean another one, or the session, is done with the phone.
+# Claude Code and Codex read the same hook format: {"hooks": {"Stop": [{"hooks": [handler]}]}},
+# Claude Code in ~/.claude/settings.json, Codex in ~/.codex/hooks.json; phonectl's handler goes
+# next to whatever hooks are there already. Stop fires when the agent's turn ends. Not
+# SubagentStop: a subagent that finishes (one that read code, say) does not mean another one,
+# or the session, is done with the phone.
 CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
-_CLAUDE_EVENTS = ("Stop",)
-_CLAUDE_OLD_EVENTS = ("Stop", "SubagentStop")  # where earlier versions put it: taken out of both
+CODEX_HOOKS = HOME / ".codex" / "hooks.json"
+_STOP_EVENTS = ("Stop",)
+_OLD_EVENTS = ("Stop", "SubagentStop")  # where earlier versions put it: taken out of both
 
 
-def _claude_unhook(data: dict) -> dict:
+def _unhook(data: dict) -> dict:
     """data without phonectl's hooks; everything else, empty lists included, as it was."""
     hooks = data.get("hooks")
     if not isinstance(hooks, dict):
         return data
     emptied = False
-    for event in _CLAUDE_OLD_EVENTS:
+    for event in _OLD_EVENTS:
         groups = hooks.get(event)
         if not isinstance(groups, list):
             continue
@@ -403,27 +406,43 @@ def _claude_unhook(data: dict) -> dict:
     return data
 
 
-def _claude_hook(command: str, changed: list[str]) -> None:
-    data = _claude_unhook(_load_json(CLAUDE_SETTINGS))
+def _add_stop_hook(path: Path, command: str, changed: list[str]) -> None:
+    data = _unhook(_load_json(path))
     hooks = data.setdefault("hooks", {})
     if not isinstance(hooks, dict):
-        raise SetupError(f"{CLAUDE_SETTINGS}: hooks is not an object; fix it first")
-    for event in _CLAUDE_EVENTS:
+        raise SetupError(f"{path}: hooks is not an object; fix it first")
+    for event in _STOP_EVENTS:
         groups = hooks.setdefault(event, [])
         if not isinstance(groups, list):
-            raise SetupError(f"{CLAUDE_SETTINGS}: hooks.{event} is not a list; fix it first")
+            raise SetupError(f"{path}: hooks.{event} is not a list; fix it first")
         groups.append({"hooks": [{"type": "command", "command": command, "timeout": 5}]})
-    _write_json(CLAUDE_SETTINGS, data, changed)
+    _write_json(path, data, changed)
+
+
+def _remove_stop_hook(path: Path, changed: list[str]) -> None:
+    if not path.exists():
+        return
+    data = _load_json(path)
+    before = json.dumps(data)
+    data = _unhook(data)
+    if json.dumps(data) != before:  # leave the file as it is when none of ours was in it
+        _write_json(path, data, changed)
+
+
+def _claude_hook(command: str, changed: list[str]) -> None:
+    _add_stop_hook(CLAUDE_SETTINGS, command, changed)
 
 
 def _claude_unhook_file(changed: list[str]) -> None:
-    if not CLAUDE_SETTINGS.exists():
-        return
-    data = _load_json(CLAUDE_SETTINGS)
-    before = json.dumps(data)
-    data = _claude_unhook(data)
-    if json.dumps(data) != before:  # leave the file as it is when none of ours was in it
-        _write_json(CLAUDE_SETTINGS, data, changed)
+    _remove_stop_hook(CLAUDE_SETTINGS, changed)
+
+
+def _codex_hook(command: str, changed: list[str]) -> None:
+    _add_stop_hook(CODEX_HOOKS, command, changed)
+
+
+def _codex_unhook(changed: list[str]) -> None:
+    _remove_stop_hook(CODEX_HOOKS, changed)
 
 
 # Gemini (agy): a named hook in ~/.gemini/config/hooks.json; Stop fires when its turn ends.
@@ -450,7 +469,9 @@ AGENTS = {a.name: a for a in [
           _claude_hook, _claude_unhook_file),
     Agent("codex", "Codex", HOME / ".codex" / "skills",
           lambda: (HOME / ".codex").exists() or _which("codex") is not None,
-          _codex_add, _codex_remove, "restart Codex (or the ChatGPT app)"),
+          _codex_add, _codex_remove,
+          "restart Codex (or the ChatGPT app), and approve the phonectl hook when it asks (Hooks need review)",
+          _codex_hook, _codex_unhook),
     Agent("gemini", "Gemini (desktop app)", HOME / ".gemini" / "config" / "skills",
           lambda: _which("agy", AGY) is not None,
           _agy_add, _agy_remove, "start a new Gemini conversation", _agy_hook, _agy_unhook),

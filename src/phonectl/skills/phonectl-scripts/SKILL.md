@@ -56,7 +56,7 @@ on its own: one application sent, one reply posted. After each unit:
 2. `POST http://127.0.0.1:47321/phonectl/yield` with the same token header. If another client
    is waiting, the phone goes to it now, and the script's next call waits in line; if nobody
    waits, nothing changes. A script that never yields keeps everyone else waiting until it
-   pauses, or for up to 30 minutes.
+   exits, pauses for 90 s, or has held the phone for 30 minutes.
 3. Start the next unit from a known place: open the app (`launch_app`), look at the screen,
    and navigate from what is there. After a yield, the screen may show anything.
 

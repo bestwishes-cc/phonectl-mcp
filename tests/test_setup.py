@@ -289,3 +289,21 @@ def test_the_hook_command_survives_quotes_in_the_token_path():
     cmd = st._hook_command("http://127.0.0.1:9/mcp", Path("/tmp/o'neil dir/token"))
     r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=10)
     assert r.returncode == 0 and r.stdout.strip() == "{}"
+
+
+def test_codex_gets_the_same_stop_hook_in_its_own_file(home, monkeypatch):
+    import json
+    from pathlib import Path
+
+    hooks = home / "codex-hooks.json"
+    monkeypatch.setattr(st, "CODEX_HOOKS", hooks)
+    theirs = {"hooks": [{"type": "command", "command": "notify.sh"}]}
+    hooks.write_text(json.dumps({"hooks": {"Stop": [theirs]}}))
+    cmd = st._hook_command(URL, Path("/tok"))
+    st._codex_hook(cmd, [])
+    st._codex_hook(cmd, [])
+    data = json.loads(hooks.read_text())
+    ours = [h for g in data["hooks"]["Stop"] for h in g["hooks"] if "/phonectl/done" in h["command"]]
+    assert len(ours) == 1 and theirs in data["hooks"]["Stop"]
+    st._codex_unhook([])
+    assert json.loads(hooks.read_text()) == {"hooks": {"Stop": [theirs]}}
