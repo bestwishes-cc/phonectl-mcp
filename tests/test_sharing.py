@@ -89,7 +89,7 @@ def test_processes_take_turns(srv):
     out, _ = b.communicate(timeout=20)
     waited = time.monotonic() - t0
     a.wait(10)
-    assert "in use by python" in out and "(pid " in out, out
+    assert f"(pid {a.pid})" in out, out  # names a's process (its name is Python on some installs)
     assert "b tapped" in out
     assert waited >= IDLE_S  # b waited for a's idle time instead of tapping in between
 
