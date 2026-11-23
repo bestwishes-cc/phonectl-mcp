@@ -15,7 +15,7 @@
 
 <p align="center"><a href="#安装">安装</a> · <a href="#工具">工具</a> · <a href="#排查问题">排查问题</a> · <a href="#安全">安全</a></p>
 
-一个 MCP 服务，对连着 Mac 的 iPhone 截图、读屏幕文字、点按、滑动、打字、按按钮、启动 App、读写剪贴板。手机上不用装东西。多个 Agent 和脚本可以同时连着用：它们轮流操作，不会点到彼此的屏幕上。
+一个 MCP 服务，对连着 Mac 的 iPhone 截图、读屏幕文字、点按、滑动、打字、按按钮、启动 App、读写剪贴板。手机上不用装东西，不需要 Xcode，不用越狱。多个 Agent 和脚本可以同时连着用：它们轮流操作，不会点到彼此的屏幕上。
 
 <table align="center">
   <tr>
@@ -38,33 +38,23 @@
 
 ## 安装
 
-### 让 agent 帮你装
-
-把下面这段话发给你的编程 agent（Claude Code、Codex、Cursor 等）：
-
-> 按 https://github.com/jiefeng-ai/phonectl-mcp#install-by-hand 安装 phonectl-mcp，并把它加进你的 MCP 配置。运行 `phonectl doctor`，直到全部通过。需要我在手机上操作时，一步步告诉我，等我做完再继续。最后告诉我怎么重启你，让手机工具加载进来。
-
-重启之后，让 agent 截一张手机屏幕试试。
-
-### 手动安装
-
-三条都要执行：
-
 ```sh
 uv tool install phonectl-mcp
-phonectl install-service   # 开机自启服务，地址 http://127.0.0.1:47321/mcp
-phonectl doctor            # 检查数据线、信任、开发者模式、磁盘镜像和服务
+phonectl install-service      # 开机自启服务，地址 http://127.0.0.1:47321/mcp
+phonectl doctor               # 检查数据线、信任、开发者模式、磁盘镜像和服务
+phonectl setup claude-code    # 或者：codex、gemini（桌面版）、deepseek-harness
 ```
 
-`install-service` 还会在 `~/.config/phonectl/token` 生成访问令牌。然后连接你用的 Agent，每个 Agent 一条命令：
+按 `setup` 的提示让 Agent 重新加载，再让它截一张手机屏幕试试。`setup` 把服务和令牌加进 Agent 的 MCP 配置，装上 `phonectl-scripts` skill，并给 Claude Code、Codex 和 Gemini 装一个钩子：Agent 这一轮结束就交还手机（Codex 会请你批准一次）。改动的文件先备份为 `<文件>.phonectl.bak`。
 
-```sh
-phonectl setup claude-code        # 或者：codex、gemini（桌面版）、deepseek-harness
-```
+也可以把下面这段话发给你的编程 Agent：
 
-`setup` 把服务和令牌加进 Agent 的 MCP 配置，装上 `phonectl-scripts` skill（脚本怎样和别人共用手机），并给 Claude Code、Codex 和 Gemini 装一个钩子：Agent 这一轮结束就交还手机（Codex 会请你批准一次）。改动的文件先备份为 `<文件>.phonectl.bak`。`phonectl setup --remove <agent>` 撤销；升级后运行 `phonectl update`。
+> 按 https://github.com/jiefeng-ai/phonectl-mcp/blob/main/README.zh-CN.md#安装 安装 phonectl-mcp，用 `phonectl setup` 把你自己接上。运行 `phonectl doctor`，直到全部通过。需要我在手机上操作时，一步步告诉我，等我做完再继续。最后告诉我怎么重启你，让手机工具加载进来。
 
-**其他客户端手动配置**（`~/.cursor/mcp.json` 等支持 streamable HTTP 的客户端）。这样配置的 Agent 能操作手机，但没有那个 skill：它写的脚本不知道要把手机让给别的 Agent。
+<details>
+<summary>其他 MCP 客户端（Cursor 等支持 streamable HTTP 的客户端）</summary>
+
+手动加入服务。这样 Agent 能操作手机，但没有那个 skill：它写的脚本不知道要把手机让给别的 Agent。
 
 ```json
 {
@@ -77,9 +67,7 @@ phonectl setup claude-code        # 或者：codex、gemini（桌面版）、dee
 }
 ```
 
-重启客户端让它加载服务，再让 agent 截一张手机屏幕试试。
-
-用数据线设置过一次后，手机和 Mac 在同一个 Wi-Fi 下就可以不插线。
+</details>
 
 ## 工具
 
@@ -101,6 +89,12 @@ phonectl setup claude-code        # 或者：codex、gemini（桌面版）、dee
 操作手机的工具会在操作后返回一张截图（传 `screenshot=False` 则不返回）。手机不确认点按是否生效，请看这张截图判断。
 
 **脚本。** 固定的一串步骤写成脚本，比让模型一步一个来回更快、更省。脚本是同一个服务的又一个 MCP 客户端（同一个地址、同一个令牌），不要直接连手机。用 `phonectl setup` 接入的 Agent 会从 `phonectl-scripts` skill 读到完整的规矩。
+
+`phonectl hold 30m` 让 Agent 在你自己用手机时让开，`phonectl hold off` 结束。
+
+## 原理
+
+服务通过苹果的开发者服务控制手机，用的是 [pymobiledevice3](https://github.com/doronz88/pymobiledevice3)。点按和按键走的是 Xcode 投屏同一条通道，所以需要 iOS 27。`read_text` 在 Mac 上用苹果的 Vision 框架识别屏幕文字。手机上只会挂载苹果自己的开发者磁盘镜像，由服务自动完成：没有 WebDriverAgent，不装 App，不越狱。
 
 ## 排查问题
 
@@ -144,7 +138,21 @@ phonectl setup claude-code        # 或者：codex、gemini（桌面版）、dee
 
 </details>
 
-其他命令：`phonectl restart`（比如 `uv tool upgrade phonectl-mcp` 升级之后），`phonectl hold 30m`（你自己用手机时让 Agent 让开，`off` 结束）。卸载：`phonectl uninstall-service`、`uv tool uninstall phonectl-mcp`，再删掉 `~/.config/phonectl`。
+## 升级和卸载
+
+```sh
+uv tool upgrade phonectl-mcp && phonectl restart && phonectl update
+```
+
+每个版本改了什么：[Releases](https://github.com/jiefeng-ai/phonectl-mcp/releases)。
+
+卸载时，先对接过的每个 Agent 运行 `phonectl setup --remove <agent>`，再执行：
+
+```sh
+phonectl uninstall-service
+uv tool uninstall phonectl-mcp
+rm -r ~/.config/phonectl
+```
 
 ## 协议
 

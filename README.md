@@ -15,7 +15,7 @@
 
 <p align="center"><a href="#install">Install</a> · <a href="#tools">Tools</a> · <a href="#troubleshooting">Troubleshooting</a> · <a href="#security">Security</a></p>
 
-An MCP server for screenshots, on-screen text, taps, swipes, typing, buttons, apps and the clipboard on an iPhone connected to your Mac. Nothing to install on the phone. Several agents and scripts can use it at once: they take turns, and none taps on another's screen.
+An MCP server for screenshots, on-screen text, taps, swipes, typing, buttons, apps and the clipboard on an iPhone connected to your Mac. Nothing to install on the phone, no Xcode, no jailbreak. Several agents and scripts can use it at once: they take turns, and none taps on another's screen.
 
 <table align="center">
   <tr>
@@ -38,33 +38,23 @@ Tested on an iPhone 17 Pro with iOS 27.2 and macOS 27.
 
 ## Install
 
-### Let your agent install it
-
-Paste this to your coding agent (Claude Code, Codex, Cursor…):
-
-> Install phonectl-mcp by following https://github.com/jiefeng-ai/phonectl-mcp#install-by-hand and add it to your MCP config. Run `phonectl doctor` until it passes. When I need to do something on the phone, tell me step by step and wait for me. Finally, tell me how to restart you so the phone tools load.
-
-After the restart, ask the agent for a screenshot of the phone.
-
-### Install by hand
-
-Run all three:
-
 ```sh
 uv tool install phonectl-mcp
-phonectl install-service   # runs the server at login on http://127.0.0.1:47321/mcp
-phonectl doctor            # checks cable, trust, Developer Mode, disk image and server
+phonectl install-service      # runs the server at login on http://127.0.0.1:47321/mcp
+phonectl doctor               # checks cable, trust, Developer Mode, disk image and server
+phonectl setup claude-code    # or: codex, gemini (the desktop app), deepseek-harness
 ```
 
-`install-service` also creates an access token in `~/.config/phonectl/token`. Then connect the agent you use, one command per agent:
+Reload the agent as `setup` says, then ask it for a screenshot of the phone. `setup` adds the server and its token to the agent's MCP config, the `phonectl-scripts` skill, and, for Claude Code, Codex and Gemini, a hook that frees the phone when the agent's turn ends (Codex asks you to approve it once). It backs up each file it changes as `<file>.phonectl.bak`.
 
-```sh
-phonectl setup claude-code        # or: codex, gemini (the desktop app), deepseek-harness
-```
+Or paste this to your coding agent:
 
-`setup` adds the server and token to the agent's MCP config, installs the `phonectl-scripts` skill (how a script shares the phone), and gives Claude Code, Codex and Gemini a hook that frees the phone when the agent's turn ends (Codex asks you to approve it once). It backs up each file it changes as `<file>.phonectl.bak`. `phonectl setup --remove <agent>` undoes it; after upgrading, run `phonectl update`.
+> Install phonectl-mcp by following https://github.com/jiefeng-ai/phonectl-mcp#install and connect yourself with `phonectl setup`. Run `phonectl doctor` until it passes. When I need to do something on the phone, tell me step by step and wait for me. Finally, tell me how to restart you so the phone tools load.
 
-**Other clients by hand** (`~/.cursor/mcp.json` and others with streamable HTTP). This gives the agent the phone, but not the skill: scripts it writes will not know to yield the phone to other agents.
+<details>
+<summary>Other MCP clients (Cursor and others with streamable HTTP)</summary>
+
+Add the server by hand. The agent gets the phone but not the skill, so scripts it writes will not know to yield the phone to other agents.
 
 ```json
 {
@@ -77,9 +67,7 @@ phonectl setup claude-code        # or: codex, gemini (the desktop app), deepsee
 }
 ```
 
-Restart the client so it loads the server, then ask your agent for a screenshot of the phone.
-
-After one setup over the cable, it also works over Wi-Fi while the phone and the Mac share a network.
+</details>
 
 ## Tools
 
@@ -101,6 +89,12 @@ Coordinates are iOS points, the same as the pixels of the returned screenshot.
 Tools that act on the phone return a screenshot taken afterwards (`screenshot=False` skips it). Taps are not confirmed, so check that screenshot.
 
 **Scripts.** A fixed sequence of steps runs faster and cheaper as a script than as one model round trip per step. A script is one more MCP client of the same server (same URL, same token); never connect to the phone directly. Agents connected with `phonectl setup` get the full rules in the `phonectl-scripts` skill.
+
+`phonectl hold 30m` keeps agents off the phone while you use it; `phonectl hold off` ends that.
+
+## How it works
+
+The server drives the phone through Apple's developer services, using [pymobiledevice3](https://github.com/doronz88/pymobiledevice3). Taps and keys take the same path as Xcode's device mirroring, which is why it needs iOS 27. `read_text` reads the screen on the Mac with Apple's Vision framework. The only thing put on the phone is Apple's developer disk image, which the server mounts by itself: no WebDriverAgent, no app, no jailbreak.
 
 ## Troubleshooting
 
@@ -144,7 +138,21 @@ Run `phonectl doctor` first. It tells you which link is broken.
 
 </details>
 
-Other commands: `phonectl restart` (e.g. after `uv tool upgrade phonectl-mcp`), `phonectl hold 30m` (keep agents off the phone while you use it; `off` ends it). To remove: `phonectl uninstall-service`, `uv tool uninstall phonectl-mcp`, and delete `~/.config/phonectl`.
+## Update and uninstall
+
+```sh
+uv tool upgrade phonectl-mcp && phonectl restart && phonectl update
+```
+
+What changed in each version: [Releases](https://github.com/jiefeng-ai/phonectl-mcp/releases).
+
+To uninstall, run `phonectl setup --remove <agent>` for each agent you connected, then:
+
+```sh
+phonectl uninstall-service
+uv tool uninstall phonectl-mcp
+rm -r ~/.config/phonectl
+```
 
 ## License
 
