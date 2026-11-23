@@ -17,7 +17,7 @@ import pytest
 from http_client import Phone, PhoneError, ScreenChanged, Waiting
 
 HERE = Path(__file__).parent
-IDLE_S = 1.0
+IDLE_S = 2.0  # wide enough that a slow machine still tells "given up" from "idle ran out"
 WAIT_S = 3.0
 
 
