@@ -62,7 +62,7 @@ phonectl doctor            # 检查数据线、信任、开发者模式、磁盘
 phonectl setup claude-code        # 或者：codex、gemini（桌面版）、deepseek-harness
 ```
 
-`setup` 会把服务连同令牌加进这个 Agent 的 MCP 配置，装上 `phonectl-scripts` skill（和别的 Agent 共用手机的脚本要守的规矩：排队、在两个工作单元之间让出手机、被打断后能接着做），并给 Claude Code、Codex 和 Gemini 装上一个钩子：Agent 这一轮结束时马上交还手机（Codex 第一次启动时会在 Hooks need review 里请你批准一次）。第一次改动某个文件之前，它会把原文件保存为 `<文件>.phonectl.bak`，改完列出改了什么。只输入 `phonectl setup` 会列出它认识的 Agent；`phonectl setup --remove <agent>` 把这些都撤掉。升级 phonectl 之后，`phonectl update` 会更新所有这样装过的 Agent 里的 skill（`doctor` 会提示哪个落后了）；你手动改过的 skill 不会被覆盖。
+`setup` 把服务和令牌加进 Agent 的 MCP 配置，装上 `phonectl-scripts` skill（脚本怎样和别人共用手机），并给 Claude Code、Codex 和 Gemini 装一个钩子：Agent 这一轮结束就交还手机（Codex 会请你批准一次）。改动的文件先备份为 `<文件>.phonectl.bak`。`phonectl setup --remove <agent>` 撤销；升级后运行 `phonectl update`。
 
 **其他客户端手动配置**（`~/.cursor/mcp.json` 等支持 streamable HTTP 的客户端）。这样配置的 Agent 能操作手机，但没有那个 skill：它写的脚本不知道要把手机让给别的 Agent。
 
@@ -102,13 +102,13 @@ phonectl setup claude-code        # 或者：codex、gemini（桌面版）、dee
 
 ## 多个 Agent 共用一台手机
 
-连到服务的客户端共用这台手机，轮流使用：一个客户端开始用手机后，就为它的整个任务一直占着，直到它明确表示做完了：这一轮结束（回复结束的钩子，见下）、脚本在两个工作单元之间让出、或者它的进程退出。服务不根据调用之间的停顿去猜任务是否结束；只有连续 90 秒没调用、又有人在排队时，才当它用完了，它下次调用时会自己重新排队。这期间别的客户端的调用会排队等待，不会落到对方的屏幕上。一次调用最多等 50 秒，比各个 Agent 自己的工具超时都短；等不到就返回 `WAITING`，什么都没做，这个客户端的排队位置保留 2 分钟，再调用一次就从原位接着等。Agent 会把 `WAITING` 当作再调用一次的提示，而不是失败。`status` 会显示谁在用手机、谁在排队。
+连到同一个服务的 Agent 和脚本轮流用手机：
 
-- 服务按进程区分客户端：一个 Claude Code 会话和它的子 Agent 算一个客户端。Agent 运行的脚本算作这个 Agent 本人，不用等它，也不会把手机从它手里拿走；从终端直接运行的脚本是一个单独的客户端。一个进程里跑几个互不相干的任务时，每个任务发送请求头 `X-Phonectl-Client: <名字>`。客户端的进程一退出，手机马上空出来，起了名字的客户端也一样。
-- 只有在别人改变过屏幕之后、发出操作的这个进程又看过屏幕，它的点按、滑动、打字、按键才会发出（这里 Agent 运行的脚本算单独的进程：脚本看了屏幕不等于 Agent 看过，脚本的点按也会让 Agent 需要重新看）。否则这次调用返回错误 `NOT DONE`，什么都不发；先看一眼屏幕，再决定要不要重做。服务启动后每个进程的第一次这类操作也是如此，因为服务不知道之前谁用过手机。`tap_text` 也守这条规矩，因为它找到的文字可能在别人的 App 里；但如果调用方之后自己用 `launch_app` 打开过它的 App，就照常执行。`launch_app`、`press_button` 不依赖旧坐标，总是照常执行。Agent 第一次启动的进程，算作看过这个 Agent 最近看到的画面（每次调用都新开一个进程的工具，会在这一次看屏、下一次点按）；服务没法知道 Agent 是从它的哪个进程读到屏幕内容的。
-- 长时间运行的脚本，在两个工作单元之间调用 `POST /phonectl/yield`（同一个令牌）让出手机：只有在有人排队时才交出去。不让出的话，别人要等它退出、连续 90 秒不调用，或者占满 30 分钟。
-- Agent 这一轮结束时，它的钩子可以调用 `POST /phonectl/done` 告诉服务，手机马上空出来，不用等 90 秒；`phonectl setup` 会给 Claude Code、Codex 和 Gemini 装上这个钩子。服务按进程区分客户端，所以同一个桌面应用（Codex、Gemini）里的所有对话算一个客户端：其中任何一个对话这一轮结束，都会交还手机；另一个正在用手机的对话，下次调用时重新排队。
-- 服务看不到你本人在用手机：`phonectl hold 30m` 让各个 Agent 让开，`phonectl hold off` 结束。
+- 一个客户端为整个任务占着手机。它这一轮结束、进程退出，或者脚本在两个工作单元之间让出（`POST /phonectl/yield`）时，手机交给下一个。有人排队时，它连续 90 秒不调用也会失去手机。
+- 别人排队等。一次调用等 50 秒还没轮到就返回 `WAITING`，什么都没做；再调用一次，排队位置不变。
+- 别人改过屏幕之后，调用方没重新看屏幕就点按或打字，会被拒绝（`NOT DONE`）。
+- 服务按进程区分客户端：一个 Claude Code 会话连同它的子 Agent 算一个；一个桌面应用（Codex、Gemini）连同它所有的对话也算一个。
+- `phonectl hold 30m` 让 Agent 在你自己用手机时让开，`phonectl hold off` 结束。
 
 ## 脚本
 

@@ -62,7 +62,7 @@ phonectl doctor            # checks cable, trust, Developer Mode, disk image and
 phonectl setup claude-code        # or: codex, gemini (the desktop app), deepseek-harness
 ```
 
-`setup` adds the server to the agent's MCP config, with the token, installs the `phonectl-scripts` skill (the rules for a script that shares the phone: wait in line, yield between units of work, survive being interrupted), and, for Claude Code, Codex and Gemini, a hook that frees the phone when the agent's turn ends (Codex asks you to approve it once, under Hooks need review). Before it first changes a file, it keeps the original as `<file>.phonectl.bak`, and it prints what it changed. `phonectl setup` alone lists the agents it knows; `phonectl setup --remove <agent>` takes all of it out again. After upgrading phonectl, `phonectl update` brings the skill up to date in every agent set up this way (`doctor` says when one is behind); a skill you edited by hand is left as it is.
+`setup` adds the server and token to the agent's MCP config, installs the `phonectl-scripts` skill (how a script shares the phone), and gives Claude Code, Codex and Gemini a hook that frees the phone when the agent's turn ends (Codex asks you to approve it once). It backs up each file it changes as `<file>.phonectl.bak`. `phonectl setup --remove <agent>` undoes it; after upgrading, run `phonectl update`.
 
 **Other clients by hand** (`~/.cursor/mcp.json` and others with streamable HTTP). This gives the agent the phone, but not the skill: scripts it writes will not know to yield the phone to other agents.
 
@@ -102,13 +102,13 @@ Tools that act on the phone return a screenshot taken afterwards (`screenshot=Fa
 
 ## Several agents, one phone
 
-All clients of the server share the phone, and they take turns: a client that starts using it keeps it for its whole task, until it says it is done: its turn ends (an end-of-turn hook, below), a script yields between units of work, or its process exits. The server does not guess the end of a task from the pauses between calls; only a client that made no call for 90 s while someone waits is taken to be done, and it gets back in line on its next call. A call from another client meanwhile waits in line instead of landing on the other agent's screen. A wait lasts at most 50 s, shorter than any agent's own tool timeout; then the call ends with `WAITING`, having done nothing, and the client keeps its place in line for 2 minutes: calling again carries on from there. Agents read `WAITING` as a reason to call again, not as a failure. `status` says who has the phone and who waits.
+Agents and scripts on the same server take turns:
 
-- Clients are told apart by their process: a Claude Code session and its subagents are one client. A script that an agent runs counts as that agent, so it neither waits for the agent nor takes the phone from it; a script started from a terminal is a client of its own. A process that runs several independent tasks sends a header `X-Phonectl-Client: <name>` per task. When a client's process exits, the phone is free at once, named or not.
-- A tap, swipe, typing or key press is sent only if the process making it has looked at the screen since anyone else changed it (a script an agent runs is its own process here: its look does not show the agent the screen, and its taps make the agent look again). Otherwise the call fails with `NOT DONE` and nothing is sent; look at the screen and repeat it. This also holds for a process's first such input after the server starts, since the server cannot know who used the phone before. `tap_text` is held to the same rule, since the text it finds may be in someone else's app, unless the caller has opened its own app with `launch_app` since. `launch_app` and `press_button` need no old coordinates and are always sent. A process an agent starts for the first time counts as having seen what the agent last saw (a tool run once per call looks in one run and taps in the next); the server cannot tell which of an agent's processes it read the screen from.
-- A long-running script gives the phone up between two units of work with `POST /phonectl/yield` (same token), which hands it over only if someone is waiting. Without that, others wait until it exits, makes no call for 90 s, or has held the phone for 30 minutes.
-- When an agent's turn ends, its hook can say so with `POST /phonectl/done`, and the phone is free at once instead of after 90 s; `phonectl setup` adds that hook to Claude Code, Codex and Gemini. The server tells clients apart by process, so all conversations of one desktop app (Codex's, Gemini's) are one client: any of them ending its turn frees the phone, and another that was using it gets back in line on its next call.
-- The server cannot see you using the phone by hand: `phonectl hold 30m` keeps agents off it, `phonectl hold off` ends that.
+- A client keeps the phone for its whole task. It gives it up when its turn ends, when its process exits, or when a script yields between units of work (`POST /phonectl/yield`). If it makes no call for 90 s while someone waits, it loses the phone.
+- Others wait in line. After 50 s a call returns `WAITING` without doing anything; calling again keeps the place in line.
+- A tap or typing is refused with `NOT DONE` if someone else changed the screen since the caller last looked.
+- Clients are told apart by process: a Claude Code session with its subagents is one client, and so is a desktop app (Codex, Gemini) with all its conversations.
+- `phonectl hold 30m` keeps agents off the phone while you use it; `phonectl hold off` ends that.
 
 ## Scripts
 
