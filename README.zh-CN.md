@@ -13,7 +13,7 @@
   <a href="https://github.com/jiefeng-ai/phonectl-mcp/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
 </p>
 
-<p align="center"><a href="#安装">安装</a> · <a href="#工具">工具</a> · <a href="#脚本">脚本</a> · <a href="#排查问题">排查问题</a> · <a href="#安全">安全</a></p>
+<p align="center"><a href="#安装">安装</a> · <a href="#工具">工具</a> · <a href="#排查问题">排查问题</a> · <a href="#安全">安全</a></p>
 
 一个 MCP 服务，对连着 Mac 的 iPhone 截图、读屏幕文字、点按、滑动、打字、按按钮、启动 App、读写剪贴板。手机上不用装东西。多个 Agent 和脚本可以同时连着用：它们轮流操作，不会点到彼此的屏幕上。
 
@@ -100,41 +100,7 @@ phonectl setup claude-code        # 或者：codex、gemini（桌面版）、dee
 
 操作手机的工具会在操作后返回一张截图（传 `screenshot=False` 则不返回）。手机不确认点按是否生效，请看这张截图判断。
 
-## 脚本
-
-步骤固定的流程不需要模型在每一步之间思考。写成脚本后，Agent 只需要运行一条命令，不再每一步都和模型往返一次。脚本就是这个服务的又一个 MCP 客户端，用哪个 MCP 库都行。用官方 Python SDK 的写法：
-
-```python
-# /// script
-# dependencies = ["mcp>=2.3,<3"]
-# ///
-import asyncio, json
-from pathlib import Path
-from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamable_http_client
-from mcp.shared._httpx_utils import create_mcp_http_client
-
-async def main():
-    token = (Path.home() / ".config/phonectl/token").read_text().strip()
-    http = create_mcp_http_client(headers={"Authorization": f"Bearer {token}"})
-    async with streamable_http_client("http://127.0.0.1:47321/mcp", http_client=http) as (read, write, *_):
-        async with ClientSession(read, write) as phone:
-            await phone.initialize()
-            for tool, args in [("launch_app", {"bundle_id": "com.apple.Preferences", "restart": True}),
-                               ("tap_text", {"text": "无线局域网", "timeout_s": 5, "settle_ms": 1000}),
-                               ("read_text", {})]:
-                args = {**args, "screenshot": False} if tool != "read_text" else args
-                result = await phone.call_tool(tool, args)
-                while result.is_error and result.content[0].text.startswith("WAITING"):
-                    result = await phone.call_tool(tool, args)  # another client has the phone: same place in line
-                if result.is_error:  # NOT DONE、手机断开：停下，不要往下走
-                    return f"{tool}: {result.content[0].text}"
-            return [line["t"] for line in json.loads(result.content[0].text)]
-
-print(asyncio.run(main()))
-```
-
-用 `uv run script.py` 运行。它的调用和 Agent 一样共用手机：别人在用时排队等待；被拒绝的调用返回错误结果；脚本一退出，手机马上空出来。
+**脚本。** 固定的一串步骤写成脚本，比让模型一步一个来回更快、更省。脚本是同一个服务的又一个 MCP 客户端（同一个地址、同一个令牌），不要直接连手机。用 `phonectl setup` 接入的 Agent 会从 `phonectl-scripts` skill 读到完整的规矩。
 
 ## 排查问题
 

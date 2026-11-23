@@ -13,7 +13,7 @@
   <a href="https://github.com/jiefeng-ai/phonectl-mcp/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
 </p>
 
-<p align="center"><a href="#install">Install</a> · <a href="#tools">Tools</a> · <a href="#scripts">Scripts</a> · <a href="#troubleshooting">Troubleshooting</a> · <a href="#security">Security</a></p>
+<p align="center"><a href="#install">Install</a> · <a href="#tools">Tools</a> · <a href="#troubleshooting">Troubleshooting</a> · <a href="#security">Security</a></p>
 
 An MCP server for screenshots, on-screen text, taps, swipes, typing, buttons, apps and the clipboard on an iPhone connected to your Mac. Nothing to install on the phone. Several agents and scripts can use it at once: they take turns, and none taps on another's screen.
 
@@ -100,41 +100,7 @@ Coordinates are iOS points, the same as the pixels of the returned screenshot.
 
 Tools that act on the phone return a screenshot taken afterwards (`screenshot=False` skips it). Taps are not confirmed, so check that screenshot.
 
-## Scripts
-
-A fixed sequence of steps does not need a model to think between them. As a script, it is one command for the agent instead of one model round trip per step. A script is just another MCP client of the same server, on any MCP library; with the official Python SDK:
-
-```python
-# /// script
-# dependencies = ["mcp>=2.3,<3"]
-# ///
-import asyncio, json
-from pathlib import Path
-from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamable_http_client
-from mcp.shared._httpx_utils import create_mcp_http_client
-
-async def main():
-    token = (Path.home() / ".config/phonectl/token").read_text().strip()
-    http = create_mcp_http_client(headers={"Authorization": f"Bearer {token}"})
-    async with streamable_http_client("http://127.0.0.1:47321/mcp", http_client=http) as (read, write, *_):
-        async with ClientSession(read, write) as phone:
-            await phone.initialize()
-            for tool, args in [("launch_app", {"bundle_id": "com.apple.Preferences", "restart": True}),
-                               ("tap_text", {"text": "Wi-Fi", "timeout_s": 5, "settle_ms": 1000}),
-                               ("read_text", {})]:
-                args = {**args, "screenshot": False} if tool != "read_text" else args
-                result = await phone.call_tool(tool, args)
-                while result.is_error and result.content[0].text.startswith("WAITING"):
-                    result = await phone.call_tool(tool, args)  # another client has the phone: same place in line
-                if result.is_error:  # NOT DONE, the phone gone: stop instead of carrying on
-                    return f"{tool}: {result.content[0].text}"
-            return [line["t"] for line in json.loads(result.content[0].text)]
-
-print(asyncio.run(main()))
-```
-
-Run it with `uv run script.py`. Its calls share the phone like an agent's: they wait while another client has it, a refused call is an error result, and the phone is free as soon as the script exits.
+**Scripts.** A fixed sequence of steps runs faster and cheaper as a script than as one model round trip per step. A script is one more MCP client of the same server (same URL, same token); never connect to the phone directly. Agents connected with `phonectl setup` get the full rules in the `phonectl-scripts` skill.
 
 ## Troubleshooting
 
