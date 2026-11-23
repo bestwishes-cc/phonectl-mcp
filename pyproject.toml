@@ -1,6 +1,6 @@
 [project]
 name = "phonectl-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "MCP server that lets AI agents see and drive a real iPhone from a Mac, over USB or Wi-Fi. Several agents can share one phone. Nothing to install on the phone."
 readme = "README.md"
 license = "MIT"
