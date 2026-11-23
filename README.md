@@ -13,9 +13,9 @@
   <a href="https://github.com/jiefeng-ai/phonectl-mcp/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
 </p>
 
-<p align="center"><a href="#install">Install</a> · <a href="#tools">Tools</a> · <a href="#several-agents-one-phone">Sharing</a> · <a href="#scripts">Scripts</a> · <a href="#troubleshooting">Troubleshooting</a> · <a href="#security">Security</a></p>
+<p align="center"><a href="#install">Install</a> · <a href="#tools">Tools</a> · <a href="#scripts">Scripts</a> · <a href="#troubleshooting">Troubleshooting</a> · <a href="#security">Security</a></p>
 
-An MCP server for screenshots, on-screen text, taps, swipes, typing, buttons, apps and the clipboard on an iPhone connected to your Mac. Nothing to install on the phone.
+An MCP server for screenshots, on-screen text, taps, swipes, typing, buttons, apps and the clipboard on an iPhone connected to your Mac. Nothing to install on the phone. Several agents and scripts can use it at once: they take turns, and none taps on another's screen.
 
 <table align="center">
   <tr>
@@ -100,16 +100,6 @@ Coordinates are iOS points, the same as the pixels of the returned screenshot.
 
 Tools that act on the phone return a screenshot taken afterwards (`screenshot=False` skips it). Taps are not confirmed, so check that screenshot.
 
-## Several agents, one phone
-
-Agents and scripts on the same server take turns:
-
-- A client keeps the phone for its whole task. It gives it up when its turn ends, when its process exits, or when a script yields between units of work (`POST /phonectl/yield`). If it makes no call for 90 s while someone waits, it loses the phone.
-- Others wait in line. After 50 s a call returns `WAITING` without doing anything; calling again keeps the place in line.
-- A tap or typing is refused with `NOT DONE` if someone else changed the screen since the caller last looked.
-- Clients are told apart by process: a Claude Code session with its subagents is one client, and so is a desktop app (Codex, Gemini) with all its conversations.
-- `phonectl hold 30m` keeps agents off the phone while you use it; `phonectl hold off` ends that.
-
 ## Scripts
 
 A fixed sequence of steps does not need a model to think between them. As a script, it is one command for the agent instead of one model round trip per step. A script is just another MCP client of the same server, on any MCP library; with the official Python SDK:
@@ -188,7 +178,7 @@ Run `phonectl doctor` first. It tells you which link is broken.
 
 </details>
 
-Other commands: `phonectl restart` (e.g. after `uv tool upgrade phonectl-mcp`). To remove: `phonectl uninstall-service`, `uv tool uninstall phonectl-mcp`, and delete `~/.config/phonectl`.
+Other commands: `phonectl restart` (e.g. after `uv tool upgrade phonectl-mcp`), `phonectl hold 30m` (keep agents off the phone while you use it; `off` ends it). To remove: `phonectl uninstall-service`, `uv tool uninstall phonectl-mcp`, and delete `~/.config/phonectl`.
 
 ## License
 

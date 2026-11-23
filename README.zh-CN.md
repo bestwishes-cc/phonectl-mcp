@@ -13,9 +13,9 @@
   <a href="https://github.com/jiefeng-ai/phonectl-mcp/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
 </p>
 
-<p align="center"><a href="#安装">安装</a> · <a href="#工具">工具</a> · <a href="#多个-agent-共用一台手机">共用</a> · <a href="#脚本">脚本</a> · <a href="#排查问题">排查问题</a> · <a href="#安全">安全</a></p>
+<p align="center"><a href="#安装">安装</a> · <a href="#工具">工具</a> · <a href="#脚本">脚本</a> · <a href="#排查问题">排查问题</a> · <a href="#安全">安全</a></p>
 
-一个 MCP 服务，对连着 Mac 的 iPhone 截图、读屏幕文字、点按、滑动、打字、按按钮、启动 App、读写剪贴板。手机上不用装东西。
+一个 MCP 服务，对连着 Mac 的 iPhone 截图、读屏幕文字、点按、滑动、打字、按按钮、启动 App、读写剪贴板。手机上不用装东西。多个 Agent 和脚本可以同时连着用：它们轮流操作，不会点到彼此的屏幕上。
 
 <table align="center">
   <tr>
@@ -100,16 +100,6 @@ phonectl setup claude-code        # 或者：codex、gemini（桌面版）、dee
 
 操作手机的工具会在操作后返回一张截图（传 `screenshot=False` 则不返回）。手机不确认点按是否生效，请看这张截图判断。
 
-## 多个 Agent 共用一台手机
-
-连到同一个服务的 Agent 和脚本轮流用手机：
-
-- 一个客户端为整个任务占着手机。它这一轮结束、进程退出，或者脚本在两个工作单元之间让出（`POST /phonectl/yield`）时，手机交给下一个。有人排队时，它连续 90 秒不调用也会失去手机。
-- 别人排队等。一次调用等 50 秒还没轮到就返回 `WAITING`，什么都没做；再调用一次，排队位置不变。
-- 别人改过屏幕之后，调用方没重新看屏幕就点按或打字，会被拒绝（`NOT DONE`）。
-- 服务按进程区分客户端：一个 Claude Code 会话连同它的子 Agent 算一个；一个桌面应用（Codex、Gemini）连同它所有的对话也算一个。
-- `phonectl hold 30m` 让 Agent 在你自己用手机时让开，`phonectl hold off` 结束。
-
 ## 脚本
 
 步骤固定的流程不需要模型在每一步之间思考。写成脚本后，Agent 只需要运行一条命令，不再每一步都和模型往返一次。脚本就是这个服务的又一个 MCP 客户端，用哪个 MCP 库都行。用官方 Python SDK 的写法：
@@ -188,7 +178,7 @@ print(asyncio.run(main()))
 
 </details>
 
-其他命令：`phonectl restart`（比如 `uv tool upgrade phonectl-mcp` 升级之后）。卸载：`phonectl uninstall-service`、`uv tool uninstall phonectl-mcp`，再删掉 `~/.config/phonectl`。
+其他命令：`phonectl restart`（比如 `uv tool upgrade phonectl-mcp` 升级之后），`phonectl hold 30m`（你自己用手机时让 Agent 让开，`off` 结束）。卸载：`phonectl uninstall-service`、`uv tool uninstall phonectl-mcp`，再删掉 `~/.config/phonectl`。
 
 ## 协议
 
